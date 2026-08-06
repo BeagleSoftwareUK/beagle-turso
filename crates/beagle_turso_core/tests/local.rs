@@ -16,3 +16,32 @@ fn local_insert_and_query_roundtrip() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::Text("alice".into()));
 }
+
+#[test]
+fn params_bind_all_value_kinds() {
+    let db = Database::open(OpenOptions::default()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE k (i INTEGER, r REAL, t TEXT, b BLOB, n TEXT)",
+        &[],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO k (i, r, t, b, n) VALUES (?, ?, ?, ?, ?)",
+        &[
+            Value::Integer(42),
+            Value::Real(3.5),
+            Value::Text("hi".into()),
+            Value::Blob(vec![1, 2, 3]),
+            Value::Null,
+        ],
+    )
+    .unwrap();
+
+    let rows = conn.query("SELECT i, r, t, b, n FROM k", &[]).unwrap();
+    assert_eq!(rows[0].values[0], Value::Integer(42));
+    assert_eq!(rows[0].values[1], Value::Real(3.5));
+    assert_eq!(rows[0].values[2], Value::Text("hi".into()));
+    assert_eq!(rows[0].values[3], Value::Blob(vec![1, 2, 3]));
+    assert_eq!(rows[0].values[4], Value::Null);
+}
