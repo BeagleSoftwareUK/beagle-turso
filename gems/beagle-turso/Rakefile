@@ -1,0 +1,8 @@
+require "rake/extensiontask"
+require "rb_sys/extensiontask"
+
+RbSys::ExtensionTask.new("beagle_turso") do |ext|
+  ext.lib_dir = "lib/beagle_turso"
+end
+
+task default: :compile

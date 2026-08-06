@@ -22,3 +22,11 @@ target/
 # extconf build log
 mkmf.log
 **/mkmf.log
+
+# rake-compiler intermediate build dir + packaged gems (gems/*/lib/**/*.so already
+# caught above; this covers the rest of the tmp/pkg scratch rake-compiler leaves behind)
+gems/*/tmp/
+gems/*/pkg/
+
+# Gem lockfile — beagle-turso is a library gem, consumers resolve their own versions
+gems/*/Gemfile.lock
