@@ -18,3 +18,7 @@ target/
 
 # SDD scratch (ledger, briefs, review packages)
 .superpowers/
+
+# extconf build log
+mkmf.log
+**/mkmf.log
