@@ -8,7 +8,10 @@ fn local_insert_and_query_roundtrip() {
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &[])
         .expect("create");
     let affected = conn
-        .execute("INSERT INTO t (name) VALUES (?)", &[Value::Text("alice".into())])
+        .execute(
+            "INSERT INTO t (name) VALUES (?)",
+            &[Value::Text("alice".into())],
+        )
         .expect("insert");
     assert_eq!(affected, 1);
 

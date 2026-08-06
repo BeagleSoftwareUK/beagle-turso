@@ -21,7 +21,10 @@ impl std::fmt::Debug for OpenOptions {
         f.debug_struct("OpenOptions")
             .field("local_path", &self.local_path)
             .field("remote_url", &self.remote_url)
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "[redacted]"))
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
             .field("bootstrap_if_empty", &self.bootstrap_if_empty)
             .finish()
     }
@@ -157,9 +160,7 @@ impl Connection {
                 let n = row.column_count();
                 let mut vals = Vec::with_capacity(n);
                 for i in 0..n {
-                    let cv = row
-                        .get_value(i)
-                        .map_err(|e| Error::Query(e.to_string()))?;
+                    let cv = row.get_value(i).map_err(|e| Error::Query(e.to_string()))?;
                     vals.push(Value::from_turso(cv));
                 }
                 out.push(Row { values: vals });

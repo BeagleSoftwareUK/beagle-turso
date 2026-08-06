@@ -9,6 +9,9 @@ fn options_debug_redacts_auth_token() {
         bootstrap_if_empty: true,
     };
     let printed = format!("{opts:?}");
-    assert!(!printed.contains("SECRET-eyJshh"), "auth_token leaked in Debug: {printed}");
+    assert!(
+        !printed.contains("SECRET-eyJshh"),
+        "auth_token leaked in Debug: {printed}"
+    );
     assert!(printed.contains("[redacted]"));
 }

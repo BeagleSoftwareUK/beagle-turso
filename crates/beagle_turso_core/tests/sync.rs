@@ -29,7 +29,10 @@ fn synced_write_pushes_and_fresh_replica_sees_it() {
         .execute("CREATE TABLE IF NOT EXISTS m (name TEXT)", &[])
         .unwrap();
     conn_a
-        .execute("INSERT INTO m (name) VALUES (?)", &[Value::Text(marker.clone())])
+        .execute(
+            "INSERT INTO m (name) VALUES (?)",
+            &[Value::Text(marker.clone())],
+        )
         .unwrap();
     db_a.push().unwrap();
 
@@ -43,7 +46,10 @@ fn synced_write_pushes_and_fresh_replica_sees_it() {
     db_b.pull().unwrap();
     let conn_b = db_b.connect().unwrap();
     let rows = conn_b
-        .query("SELECT count(*) FROM m WHERE name = ?", &[Value::Text(marker)])
+        .query(
+            "SELECT count(*) FROM m WHERE name = ?",
+            &[Value::Text(marker)],
+        )
         .unwrap();
     assert_eq!(rows[0].values[0], Value::Integer(1));
 }
