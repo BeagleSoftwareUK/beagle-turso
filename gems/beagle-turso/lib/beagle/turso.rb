@@ -11,6 +11,8 @@ module Beagle
       def self.open(local_path:, remote_url: nil, auth_token: nil, bootstrap_if_empty: true)
         _open(local_path, remote_url, auth_token, bootstrap_if_empty)
       end
+
+      private_class_method :_open
     end
   end
 end
