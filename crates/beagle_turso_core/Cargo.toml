@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "A synchronous Rust façade over the Turso database engine."
 readme = "README.md"
+repository = "https://github.com/BeagleSoftwareUK/beagle-turso"
 
 [dependencies]
 turso = { version = "=0.7.2", features = ["sync"] }
