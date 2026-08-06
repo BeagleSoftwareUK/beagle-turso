@@ -93,9 +93,38 @@ impl RbDatabase {
         Ok(RbDatabase { inner: db })
     }
 
+    // Positional primitive backing the keyword-arg `Database.open` defined in
+    // Ruby (see lib/beagle/turso.rb). Kept positional so magnus can
+    // TryConvert `nil`/`String`/bool natively for each argument, instead of
+    // parsing an RHash of keyword args by hand in Rust.
+    fn open(
+        ruby: &Ruby,
+        local_path: String,
+        remote_url: Option<String>,
+        auth_token: Option<String>,
+        bootstrap_if_empty: bool,
+    ) -> Result<RbDatabase, Error> {
+        let opts = OpenOptions {
+            local_path,
+            remote_url,
+            auth_token,
+            bootstrap_if_empty,
+        };
+        let db = Database::open(opts).map_err(|e| rt_err(ruby, e.to_string()))?;
+        Ok(RbDatabase { inner: db })
+    }
+
     fn connect(ruby: &Ruby, rb_self: &Self) -> Result<RbConnection, Error> {
         let c = rb_self.inner.connect().map_err(|e| rt_err(ruby, e.to_string()))?;
         Ok(RbConnection { inner: c })
+    }
+
+    fn push(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.inner.push().map_err(|e| rt_err(ruby, e.to_string()))
+    }
+
+    fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
+        rb_self.inner.pull().map_err(|e| rt_err(ruby, e.to_string()))
     }
 }
 
@@ -125,7 +154,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let turso = ruby.define_module("Beagle")?.define_module("Turso")?;
     let db = turso.define_class("Database", ruby.class_object())?;
     db.define_singleton_method("open_local", function!(RbDatabase::open_local, 1))?;
+    // Positional primitive; the public keyword-arg `Database.open` wrapper
+    // lives in Ruby (lib/beagle/turso.rb) and delegates here.
+    db.define_singleton_method("_open", function!(RbDatabase::open, 4))?;
     db.define_method("connect", method!(RbDatabase::connect, 0))?;
+    db.define_method("push", method!(RbDatabase::push, 0))?;
+    db.define_method("pull", method!(RbDatabase::pull, 0))?;
     let conn = turso.define_class("Connection", ruby.class_object())?;
     conn.define_method("execute", method!(RbConnection::execute, 2))?;
     conn.define_method("query", method!(RbConnection::query, 2))?;
