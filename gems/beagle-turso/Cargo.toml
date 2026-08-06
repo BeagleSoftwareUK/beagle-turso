@@ -1,0 +1,18 @@
+# Standalone Cargo workspace for this gem's native extension.
+#
+# The monorepo root's Cargo.toml excludes gems/beagle-turso/ext/beagle_turso
+# so a plain `cargo build`/`clippy`/`test --workspace` at the repo root stays
+# Ruby-free. `bundle exec rake compile` runs rb_sys, which shells out to
+# `cargo metadata --no-deps` with NO `--manifest-path`, relying solely on the
+# current directory (this one, where the Rakefile lives) and Cargo's
+# built-in upward search for the nearest ancestor `Cargo.toml` with a
+# `[workspace]` table. Without this file, that search would keep walking up
+# past this (member-less) directory to the repo root workspace — which no
+# longer lists the ext — and rb_sys would raise `PackageNotFoundError`.
+# Declaring this small workspace here gives Cargo something to find right
+# away, independent of the root workspace. The ext still resolves its
+# `beagle_turso_core` path dependency normally regardless of which
+# workspace it belongs to.
+[workspace]
+resolver = "2"
+members = ["ext/beagle_turso"]

@@ -1,9 +1,13 @@
 # Cargo workspace for the beagle-turso monorepo.
-# The Ruby gems (beagle-turso, activerecord-beagle-turso) live under gems/, and their
-# native extensions (Magnus/rb-sys, e.g. gems/beagle-turso/ext/beagle_turso) are cargo
-# workspace members so `cargo build`/`rake compile` share the workspace's target dir
-# and lockfile. Validated spikes under spikes/ are excluded from the build.
+# Only the core Rust crate(s) under crates/ are workspace members, so the
+# core's `cargo build`/`clippy`/`test` stay Ruby-free. The Ruby gems'
+# native extensions (Magnus/rb-sys, e.g. gems/beagle-turso/ext/beagle_turso)
+# are deliberately EXCLUDED, not members: a plain `cargo build --workspace`
+# at the repo root must not need Ruby/rb-sys to build the core. Each ext
+# resolves its `beagle_turso_core` path dependency and builds standalone
+# (via rake-compiler/rb-sys) regardless of workspace membership. Validated
+# spikes under spikes/ are excluded from the build for the same reason.
 [workspace]
 resolver = "2"
-members = ["crates/beagle_turso_core", "gems/beagle-turso/ext/beagle_turso"]
-exclude = ["spikes"]
+members = ["crates/beagle_turso_core"]
+exclude = ["spikes", "gems/beagle-turso/ext/beagle_turso"]
