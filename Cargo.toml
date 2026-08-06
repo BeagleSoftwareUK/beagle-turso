@@ -1,0 +1,7 @@
+# Cargo workspace for the beagle-turso monorepo.
+# The Ruby gems (beagle-turso, activerecord-beagle-turso) live under gems/ and are
+# not cargo members. Validated spikes under spikes/ are excluded from the build.
+[workspace]
+resolver = "2"
+members = ["crates/beagle_turso_core"]
+exclude = ["spikes"]

@@ -1,0 +1,20 @@
+find_executable: checking for gcc... -------------------- yes
+
+--------------------
+
+find_executable: checking for g++... -------------------- yes
+
+--------------------
+
+find_executable: checking for gcc-ar... -------------------- yes
+
+--------------------
+
+find_executable: checking for install_name_tool... -------------------- no
+
+--------------------
+
+find_executable: checking for $(CARGO_BUILD_TARGET)-install_name_tool... -------------------- no
+
+--------------------
+
