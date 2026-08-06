@@ -1,0 +1,11 @@
+[package]
+name = "beagle_turso_wrap"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = "0.8"
+beagle_turso_core = { path = "../../crates/beagle_turso_core" }
