@@ -16,7 +16,7 @@
 
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
 use magnus::{
-    encoding::EncodingCapable, function, method, prelude::*, Error, Float, IntoValue, Integer,
+    encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
 };
 
@@ -64,7 +64,10 @@ fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
                 Value::Text(s.to_string()?)
             }
         } else {
-            return Err(Error::new(ruby.exception_type_error(), "unsupported bind parameter type"));
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "unsupported bind parameter type",
+            ));
         };
         out.push(v);
     }
@@ -115,28 +118,43 @@ impl RbDatabase {
     }
 
     fn connect(ruby: &Ruby, rb_self: &Self) -> Result<RbConnection, Error> {
-        let c = rb_self.inner.connect().map_err(|e| rt_err(ruby, e.to_string()))?;
+        let c = rb_self
+            .inner
+            .connect()
+            .map_err(|e| rt_err(ruby, e.to_string()))?;
         Ok(RbConnection { inner: c })
     }
 
     fn push(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        rb_self.inner.push().map_err(|e| rt_err(ruby, e.to_string()))
+        rb_self
+            .inner
+            .push()
+            .map_err(|e| rt_err(ruby, e.to_string()))
     }
 
     fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        rb_self.inner.pull().map_err(|e| rt_err(ruby, e.to_string()))
+        rb_self
+            .inner
+            .pull()
+            .map_err(|e| rt_err(ruby, e.to_string()))
     }
 }
 
 impl RbConnection {
     fn execute(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<u64, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        rb_self.inner.execute(&sql, &p).map_err(|e| rt_err(ruby, e.to_string()))
+        rb_self
+            .inner
+            .execute(&sql, &p)
+            .map_err(|e| rt_err(ruby, e.to_string()))
     }
 
     fn query(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<RArray, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        let rows = rb_self.inner.query(&sql, &p).map_err(|e| rt_err(ruby, e.to_string()))?;
+        let rows = rb_self
+            .inner
+            .query(&sql, &p)
+            .map_err(|e| rt_err(ruby, e.to_string()))?;
         let out = ruby.ary_new();
         for row in rows {
             let rb_row = ruby.ary_new();
