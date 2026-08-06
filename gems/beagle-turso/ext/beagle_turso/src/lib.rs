@@ -15,7 +15,7 @@
 // warnings.
 
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
-use magnus::{function, method, prelude::*, Error, IntoValue, RArray, Ruby};
+use magnus::{function, method, prelude::*, Error, Float, IntoValue, Integer, RArray, RString, Ruby};
 
 #[magnus::wrap(class = "Beagle::Turso::Database", free_immediately)]
 struct RbDatabase {
@@ -32,18 +32,23 @@ fn rt_err(ruby: &Ruby, msg: String) -> Error {
 }
 
 fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
-    // Safe: no Ruby code (which could GC/mutate the array) runs during this loop.
+    // Safe: `from_value` below is a raw type check on the Ruby object (exact
+    // class match — no `to_int`/`to_f`/`to_str` coercion method dispatch), so
+    // for the sanctioned nil/Integer/Float/String inputs no arbitrary Ruby
+    // code (which could GC/mutate the array) runs during this loop; an
+    // unsupported type falls straight to the `else` arm without invoking any
+    // Ruby method at all.
     let items = unsafe { arr.as_slice() };
     let mut out = Vec::with_capacity(items.len());
     for &item in items {
         let v = if item.is_nil() {
             Value::Null
-        } else if let Ok(i) = i64::try_convert(item) {
-            Value::Integer(i)
-        } else if let Ok(f) = f64::try_convert(item) {
-            Value::Real(f)
-        } else if let Ok(s) = String::try_convert(item) {
-            Value::Text(s)
+        } else if let Some(i) = Integer::from_value(item) {
+            Value::Integer(i.to_i64()?)
+        } else if let Some(f) = Float::from_value(item) {
+            Value::Real(f.to_f64())
+        } else if let Some(s) = RString::from_value(item) {
+            Value::Text(s.to_string()?)
         } else {
             return Err(Error::new(ruby.exception_type_error(), "unsupported bind parameter type"));
         };
