@@ -8,12 +8,23 @@ pub use error::{Error, Result};
 pub use value::Value;
 
 /// Options controlling how a [`Database`] is opened.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenOptions {
     pub local_path: String,
     pub remote_url: Option<String>,
     pub auth_token: Option<String>,
     pub bootstrap_if_empty: bool,
+}
+
+impl std::fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("local_path", &self.local_path)
+            .field("remote_url", &self.remote_url)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "[redacted]"))
+            .field("bootstrap_if_empty", &self.bootstrap_if_empty)
+            .finish()
+    }
 }
 
 impl Default for OpenOptions {
