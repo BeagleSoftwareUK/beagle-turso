@@ -1,0 +1,17 @@
+# Rust build output
+/target
+target/
+**/target/
+
+# Secrets — scratch Turso creds live here, never commit (given the leak saga)
+.env
+.env.*
+
+# Throwaway spike local replica DB files
+*.db
+*.db-*
+
+# Native extension build artifacts
+*.so
+*.o
+**/Makefile
