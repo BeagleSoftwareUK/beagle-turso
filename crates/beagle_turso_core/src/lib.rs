@@ -43,11 +43,18 @@ pub struct OpenOptions {
     pub bootstrap_if_empty: bool,
 }
 
+/// Redacts `remote_url` and `auth_token`, showing only whether each was set.
+///
+/// This is the only place secrets can leak via `{:?}`; other logging paths
+/// (e.g. engine errors from `Database::open`/`push`/`pull`) may surface the
+/// remote *host* embedded in a turso error string, but never the auth token
+/// — the token is sent as an `Authorization` header, never embedded in the
+/// URL, by this crate.
 impl std::fmt::Debug for OpenOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenOptions")
             .field("local_path", &self.local_path)
-            .field("remote_url", &self.remote_url)
+            .field("remote_url", &self.remote_url.as_ref().map(|_| "[set]"))
             .field(
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[redacted]"),
