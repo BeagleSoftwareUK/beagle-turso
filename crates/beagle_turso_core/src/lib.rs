@@ -32,11 +32,19 @@ pub struct Row {
     pub values: Vec<Value>,
 }
 
-/// A handle to an open database. Local-only for Task 2; synced/remote support
-/// is added in Task 4.
+/// The underlying engine handle: local-only, or synced with a remote Turso
+/// database via push/pull.
+enum Inner {
+    Local(turso::Database),
+    Synced(turso::sync::Database),
+}
+
+/// A handle to an open database. Local-only when [`OpenOptions::remote_url`]
+/// and [`OpenOptions::auth_token`] are `None`; synced (with [`Database::push`]
+/// / [`Database::pull`]) when both are `Some`.
 pub struct Database {
     rt: SharedRt,
-    inner: turso::Database,
+    inner: Inner,
 }
 
 /// A connection to a [`Database`], used to run SQL.
@@ -48,25 +56,69 @@ pub struct Connection {
 impl Database {
     pub fn open(opts: OpenOptions) -> Result<Database> {
         let rt = new_runtime()?;
-        // Task 2 handles local only; Task 4 branches on opts.remote_url.
         let inner = rt.block_on(async {
-            turso::Builder::new_local(&opts.local_path)
-                .build()
-                .await
-                .map_err(|e| Error::Open(e.to_string()))
+            match (&opts.remote_url, &opts.auth_token) {
+                (Some(url), Some(token)) => {
+                    let db = turso::sync::Builder::new_remote(&opts.local_path)
+                        .with_remote_url(url)
+                        .with_auth_token(token)
+                        .bootstrap_if_empty(opts.bootstrap_if_empty)
+                        .build()
+                        .await
+                        .map_err(|e| Error::Open(e.to_string()))?;
+                    Ok::<Inner, Error>(Inner::Synced(db))
+                }
+                _ => {
+                    let db = turso::Builder::new_local(&opts.local_path)
+                        .build()
+                        .await
+                        .map_err(|e| Error::Open(e.to_string()))?;
+                    Ok(Inner::Local(db))
+                }
+            }
         })?;
         Ok(Database { rt, inner })
     }
 
     pub fn connect(&self) -> Result<Connection> {
-        let conn = self
-            .inner
-            .connect()
-            .map_err(|e| Error::Connect(e.to_string()))?;
+        let conn = match &self.inner {
+            Inner::Local(db) => db.connect().map_err(|e| Error::Connect(e.to_string()))?,
+            // The synced database's connect() is async (unlike the local one).
+            Inner::Synced(db) => self
+                .rt
+                .block_on(async { db.connect().await })
+                .map_err(|e| Error::Connect(e.to_string()))?,
+        };
         Ok(Connection {
             rt: self.rt.clone(),
             conn,
         })
+    }
+
+    /// Push local changes to the remote. Errors if this database is
+    /// local-only (opened without `remote_url`/`auth_token`).
+    pub fn push(&self) -> Result<()> {
+        match &self.inner {
+            Inner::Local(_) => Err(Error::Sync("push() on a local-only database".into())),
+            Inner::Synced(db) => self
+                .rt
+                .block_on(async { db.push().await })
+                .map(|_| ())
+                .map_err(|e| Error::Sync(e.to_string())),
+        }
+    }
+
+    /// Pull remote changes; returns `true` if any changes were applied.
+    /// Errors if this database is local-only (opened without
+    /// `remote_url`/`auth_token`).
+    pub fn pull(&self) -> Result<bool> {
+        match &self.inner {
+            Inner::Local(_) => Err(Error::Sync("pull() on a local-only database".into())),
+            Inner::Synced(db) => self
+                .rt
+                .block_on(async { db.pull().await })
+                .map_err(|e| Error::Sync(e.to_string())),
+        }
     }
 }
 
