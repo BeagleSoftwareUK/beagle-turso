@@ -1,3 +1,30 @@
+//! `beagle_turso_core` — a synchronous Rust façade over the Turso engine.
+//!
+//! It wraps the async `turso` crate behind a blocking API (via an internal
+//! single-threaded Tokio runtime), so callers get a plain synchronous
+//! `Database` / `Connection` pair without needing an async runtime of their
+//! own — handy for FFI boundaries such as a Ruby extension.
+//!
+//! A [`Database`] can be opened purely local (in-memory or on-disk file, no
+//! network) or synced with a remote Turso database (see
+//! [`OpenOptions::remote_url`] / [`OpenOptions::auth_token`] and
+//! [`Database::push`] / [`Database::pull`]). Local writes to a synced
+//! database are durable to the local file as they happen; [`Database::push`]
+//! is what propagates them to the remote.
+//!
+//! The example below only exercises the local, offline path — it opens an
+//! in-memory database, so it needs no network access or credentials.
+//!
+//! ```
+//! use beagle_turso_core::{Database, OpenOptions, Value};
+//! let db = Database::open(OpenOptions::default()).unwrap();
+//! let conn = db.connect().unwrap();
+//! conn.execute("CREATE TABLE t (n TEXT)", &[]).unwrap();
+//! conn.execute("INSERT INTO t (n) VALUES (?)", &[Value::Text("x".into())]).unwrap();
+//! let rows = conn.query("SELECT n FROM t", &[]).unwrap();
+//! assert_eq!(rows[0].values[0], Value::Text("x".into()));
+//! ```
+
 mod error;
 mod runtime;
 mod value;
