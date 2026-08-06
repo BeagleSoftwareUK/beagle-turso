@@ -15,7 +15,10 @@
 // warnings.
 
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
-use magnus::{function, method, prelude::*, Error, Float, IntoValue, Integer, RArray, RString, Ruby};
+use magnus::{
+    encoding::EncodingCapable, function, method, prelude::*, Error, Float, IntoValue, Integer,
+    RArray, RString, Ruby,
+};
 
 #[magnus::wrap(class = "Beagle::Turso::Database", free_immediately)]
 struct RbDatabase {
@@ -37,8 +40,15 @@ fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
     // for the sanctioned nil/Integer/Float/String inputs no arbitrary Ruby
     // code (which could GC/mutate the array) runs during this loop; an
     // unsupported type falls straight to the `else` arm without invoking any
-    // Ruby method at all.
+    // Ruby method at all. The binary/text split below on an `RString` is
+    // likewise native: `EncodingCapable::enc_get` is a direct
+    // `rb_enc_get_index` C call (no method dispatch). For the binary branch
+    // `as_slice` is copied into an owned `Vec` immediately, before any
+    // further Ruby call in this loop iteration, so the borrow never outlives
+    // a point where the backing string could be mutated/GC'd out from under
+    // it.
     let items = unsafe { arr.as_slice() };
+    let ascii_8bit = ruby.ascii8bit_encindex();
     let mut out = Vec::with_capacity(items.len());
     for &item in items {
         let v = if item.is_nil() {
@@ -48,7 +58,11 @@ fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
         } else if let Some(f) = Float::from_value(item) {
             Value::Real(f.to_f64())
         } else if let Some(s) = RString::from_value(item) {
-            Value::Text(s.to_string()?)
+            if s.enc_get() == ascii_8bit {
+                Value::Blob(unsafe { s.as_slice() }.to_vec())
+            } else {
+                Value::Text(s.to_string()?)
+            }
         } else {
             return Err(Error::new(ruby.exception_type_error(), "unsupported bind parameter type"));
         };
