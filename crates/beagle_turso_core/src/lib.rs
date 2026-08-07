@@ -220,4 +220,31 @@ impl Connection {
             Ok(QueryResult { columns, rows: out })
         })
     }
+
+    /// Returns the rowid of the last row inserted by this connection.
+    ///
+    /// Backed by `turso::Connection::last_insert_rowid` (a plain sync call —
+    /// it reads state off the connection, no I/O — so unlike the other
+    /// methods here it needs no `block_on`). `Result` is kept in this
+    /// method's signature for API consistency with the rest of `Connection`,
+    /// even though the underlying call cannot fail.
+    pub fn last_insert_rowid(&self) -> Result<i64> {
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Runs a script of multiple `;`-separated SQL statements (e.g. schema
+    /// DDL) in one call.
+    ///
+    /// Delegates to `turso::Connection::execute_batch`, which parses the
+    /// script with the real SQL parser rather than naively splitting on
+    /// `;` — so statements containing `;` inside string literals (e.g.
+    /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn
+                .execute_batch(sql)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))
+        })
+    }
 }

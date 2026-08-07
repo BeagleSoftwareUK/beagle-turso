@@ -50,6 +50,20 @@ fn params_bind_all_value_kinds() {
 }
 
 #[test]
+fn last_rowid_and_batch() {
+    let db = Database::open(OpenOptions::default()).unwrap();
+    let c = db.connect().unwrap();
+    c.execute_batch(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT); INSERT INTO t (n) VALUES ('x');",
+    )
+    .unwrap();
+    assert_eq!(c.last_insert_rowid().unwrap(), 1);
+    c.execute("INSERT INTO t (n) VALUES (?)", &[Value::Text("y".into())])
+        .unwrap();
+    assert_eq!(c.last_insert_rowid().unwrap(), 2);
+}
+
+#[test]
 fn query_result_exposes_column_names() {
     let db = Database::open(OpenOptions::default()).unwrap();
     let conn = db.connect().unwrap();
