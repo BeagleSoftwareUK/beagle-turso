@@ -29,6 +29,8 @@ mod error;
 mod runtime;
 mod value;
 
+use std::sync::Mutex;
+
 use runtime::{new_runtime, SharedRt};
 
 pub use error::{Error, Result};
@@ -97,15 +99,25 @@ enum Inner {
 /// A handle to an open database. Local-only when [`OpenOptions::remote_url`]
 /// and [`OpenOptions::auth_token`] are `None`; synced (with [`Database::push`]
 /// / [`Database::pull`]) when both are `Some`.
+///
+/// `inner` is wrapped in a `Mutex<Option<_>>` so [`Database::close`] can drop
+/// the underlying engine handle (and, for a synced database, end its remote
+/// sync session) eagerly instead of waiting for GC. `None` means closed. A
+/// `Mutex` (not `RefCell`) is used so the type stays `Send + Sync`, which the
+/// Magnus wrap in the Ruby extension requires.
 pub struct Database {
     rt: SharedRt,
-    inner: Inner,
+    inner: Mutex<Option<Inner>>,
 }
 
 /// A connection to a [`Database`], used to run SQL.
+///
+/// `conn` is a `Mutex<Option<_>>` for the same reasons as [`Database::inner`]:
+/// [`Connection::close`] can release the handle eagerly, `None` means closed,
+/// and the `Mutex` keeps the type `Send + Sync` for the Magnus wrap.
 pub struct Connection {
     rt: SharedRt,
-    conn: turso::Connection,
+    conn: Mutex<Option<turso::Connection>>,
 }
 
 impl Database {
@@ -132,11 +144,16 @@ impl Database {
                 }
             }
         })?;
-        Ok(Database { rt, inner })
+        Ok(Database {
+            rt,
+            inner: Mutex::new(Some(inner)),
+        })
     }
 
     pub fn connect(&self) -> Result<Connection> {
-        let conn = match &self.inner {
+        let guard = self.inner.lock().unwrap();
+        let inner = guard.as_ref().ok_or(Error::Closed)?;
+        let conn = match inner {
             Inner::Local(db) => db.connect().map_err(|e| Error::Connect(e.to_string()))?,
             // The synced database's connect() is async (unlike the local one).
             Inner::Synced(db) => self
@@ -146,14 +163,16 @@ impl Database {
         };
         Ok(Connection {
             rt: self.rt.clone(),
-            conn,
+            conn: Mutex::new(Some(conn)),
         })
     }
 
     /// Push local changes to the remote. Errors if this database is
     /// local-only (opened without `remote_url`/`auth_token`).
     pub fn push(&self) -> Result<()> {
-        match &self.inner {
+        let guard = self.inner.lock().unwrap();
+        let inner = guard.as_ref().ok_or(Error::Closed)?;
+        match inner {
             Inner::Local(_) => Err(Error::Sync("push() on a local-only database".into())),
             Inner::Synced(db) => self
                 .rt
@@ -167,7 +186,9 @@ impl Database {
     /// Errors if this database is local-only (opened without
     /// `remote_url`/`auth_token`).
     pub fn pull(&self) -> Result<bool> {
-        match &self.inner {
+        let guard = self.inner.lock().unwrap();
+        let inner = guard.as_ref().ok_or(Error::Closed)?;
+        match inner {
             Inner::Local(_) => Err(Error::Sync("pull() on a local-only database".into())),
             Inner::Synced(db) => self
                 .rt
@@ -175,14 +196,38 @@ impl Database {
                 .map_err(|e| Error::Sync(e.to_string())),
         }
     }
+
+    /// Close the database, releasing the underlying engine handle and — for a
+    /// synced database — its remote sync session, instead of waiting for GC.
+    /// Idempotent. After close, [`Database::connect`]/[`Database::push`]/
+    /// [`Database::pull`] return [`Error::Closed`].
+    ///
+    /// The `turso` crate (v0.7.x) exposes no explicit async `close`/`shutdown`
+    /// on `sync::Database`/`Connection`; teardown is via `Drop`. Dropping the
+    /// last handle drops the internal `Arc<TursoDatabaseSync>`, which breaks
+    /// the sync IO worker loop and frees the sync engine — that is what ends
+    /// the server-side session. We drop the `Inner` INSIDE `rt.block_on` so a
+    /// live Tokio reactor is in scope for any async teardown that runs on drop.
+    pub fn close(&self) {
+        let inner = self.inner.lock().unwrap().take();
+        if inner.is_some() {
+            self.rt.block_on(async move { drop(inner) });
+        }
+    }
+
+    /// Whether this database has been closed (see [`Database::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().is_none()
+    }
 }
 
 impl Connection {
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let guard = self.conn.lock().unwrap();
+        let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         self.rt.block_on(async {
-            self.conn
-                .execute(sql, tparams)
+            conn.execute(sql, tparams)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
         })
@@ -196,10 +241,11 @@ impl Connection {
     /// names — needed by callers (e.g. an ActiveRecord adapter) that must
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        let guard = self.conn.lock().unwrap();
+        let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         self.rt.block_on(async {
-            let mut rows = self
-                .conn
+            let mut rows = conn
                 .query(sql, tparams)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?;
@@ -229,7 +275,9 @@ impl Connection {
     /// method's signature for API consistency with the rest of `Connection`,
     /// even though the underlying call cannot fail.
     pub fn last_insert_rowid(&self) -> Result<i64> {
-        Ok(self.conn.last_insert_rowid())
+        let guard = self.conn.lock().unwrap();
+        let conn = guard.as_ref().ok_or(Error::Closed)?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// Runs a script of multiple `;`-separated SQL statements (e.g. schema
@@ -240,11 +288,30 @@ impl Connection {
     /// `;` — so statements containing `;` inside string literals (e.g.
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        let guard = self.conn.lock().unwrap();
+        let conn = guard.as_ref().ok_or(Error::Closed)?;
         self.rt.block_on(async {
-            self.conn
-                .execute_batch(sql)
+            conn.execute_batch(sql)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
         })
+    }
+
+    /// Close this connection, releasing the underlying `turso::Connection`
+    /// handle instead of waiting for GC. Idempotent. After close, the
+    /// execution methods return [`Error::Closed`].
+    ///
+    /// As with [`Database::close`], the handle is dropped inside `rt.block_on`
+    /// so a Tokio reactor is live for any teardown that runs on drop.
+    pub fn close(&self) {
+        let conn = self.conn.lock().unwrap().take();
+        if conn.is_some() {
+            self.rt.block_on(async move { drop(conn) });
+        }
+    }
+
+    /// Whether this connection has been closed (see [`Connection::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.conn.lock().unwrap().is_none()
     }
 }

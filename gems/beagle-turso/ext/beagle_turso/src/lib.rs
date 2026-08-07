@@ -138,6 +138,17 @@ impl RbDatabase {
             .pull()
             .map_err(|e| rt_err(ruby, e.to_string()))
     }
+
+    // Release the underlying engine handle and, for a synced database, end its
+    // remote sync session, instead of waiting for GC. Idempotent.
+    fn close(_ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.inner.close();
+        Ok(())
+    }
+
+    fn is_closed(_ruby: &Ruby, rb_self: &Self) -> bool {
+        rb_self.inner.is_closed()
+    }
 }
 
 impl RbConnection {
@@ -212,6 +223,17 @@ impl RbConnection {
             .execute_batch(&sql)
             .map_err(|e| rt_err(ruby, e.to_string()))
     }
+
+    // Release the underlying connection handle instead of waiting for GC.
+    // Idempotent.
+    fn close(_ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.inner.close();
+        Ok(())
+    }
+
+    fn is_closed(_ruby: &Ruby, rb_self: &Self) -> bool {
+        rb_self.inner.is_closed()
+    }
 }
 
 #[magnus::init]
@@ -225,6 +247,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     db.define_method("connect", method!(RbDatabase::connect, 0))?;
     db.define_method("push", method!(RbDatabase::push, 0))?;
     db.define_method("pull", method!(RbDatabase::pull, 0))?;
+    db.define_method("close", method!(RbDatabase::close, 0))?;
+    db.define_method("closed?", method!(RbDatabase::is_closed, 0))?;
     let conn = turso.define_class("Connection", ruby.class_object())?;
     conn.define_method("execute", method!(RbConnection::execute, 2))?;
     conn.define_method("query", method!(RbConnection::query, 2))?;
@@ -234,5 +258,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         method!(RbConnection::last_insert_rowid, 0),
     )?;
     conn.define_method("execute_batch", method!(RbConnection::execute_batch, 1))?;
+    conn.define_method("close", method!(RbConnection::close, 0))?;
+    conn.define_method("closed?", method!(RbConnection::is_closed, 0))?;
     Ok(())
 }

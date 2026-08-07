@@ -10,6 +10,8 @@ pub enum Error {
     Sync(String),
     #[error("type error: {0}")]
     Type(String),
+    #[error("database is closed")]
+    Closed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
