@@ -1,0 +1,9 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec
+
+# beagle-turso is an unpublished path gem in this repo; installing it builds the
+# native (Rust) extension, which can take several minutes on the first run.
+gem "beagle-turso", path: "../beagle-turso"
