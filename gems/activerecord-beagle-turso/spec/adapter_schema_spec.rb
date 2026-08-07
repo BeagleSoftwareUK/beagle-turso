@@ -120,6 +120,62 @@ RSpec.describe "beagle_turso adapter schema/transactions/types" do
     end
   end
 
+  # -- Fix round 1: the bare-PRAGMA-read bridge (defer_foreign_keys /
+  # read_uncommitted) must NOT also swallow `PRAGMA foreign_key_check`, whose
+  # empty result is the *correct* "no violations" answer, not a driver gap to
+  # paper over. A generic `PRAGMA \w+` allowlist would synthesize a fake
+  # non-empty row for it and make check_all_foreign_keys_valid! raise a
+  # false-positive on perfectly clean data.
+  describe "referential integrity after PRAGMA bridging" do
+    before(:each) do
+      connect!
+      ActiveRecord::Schema.define do
+        create_table :ri_parents, force: true do |t|
+          t.string :name
+        end
+        create_table :ri_children, force: true do |t|
+          t.references :ri_parent, foreign_key: true
+          t.string :name
+        end
+      end
+    end
+
+    let(:parent_class) { Class.new(ActiveRecord::Base) { self.table_name = "ri_parents" } }
+    let(:child_class)  { Class.new(ActiveRecord::Base) { self.table_name = "ri_children" } }
+
+    it "check_all_foreign_keys_valid! does not raise on a clean FK graph" do
+      parent = parent_class.create!(name: "p1")
+      child_class.create!(ri_parent_id: parent.id, name: "c1")
+
+      expect {
+        ActiveRecord::Base.connection.check_all_foreign_keys_valid!
+      }.not_to raise_error
+    end
+
+    it "PRAGMA foreign_key_check itself comes back blank on clean data (not a synthesized row)" do
+      parent = parent_class.create!(name: "p1")
+      child_class.create!(ri_parent_id: parent.id, name: "c1")
+
+      result = ActiveRecord::Base.connection.execute("PRAGMA foreign_key_check")
+      expect(result).to be_blank
+    end
+
+    it "FK enforcement is still ON after a disable_referential_integrity-based DDL op" do
+      conn = ActiveRecord::Base.connection
+      # remove_column/change_column route through alter_table ->
+      # disable_referential_integrity, whose ensure-block restores
+      # `PRAGMA foreign_keys = ON` via the same bridged pragma read this fix
+      # round touches. Prove that restore still actually happens.
+      conn.add_column :ri_children, :note, :string
+      conn.remove_column :ri_children, :note
+
+      expect(conn.query_value("PRAGMA foreign_keys")).to eq(1)
+      expect {
+        child_class.create!(ri_parent_id: 999_999, name: "orphan")
+      }.to raise_error(ActiveRecord::InvalidForeignKey)
+    end
+  end
+
   # -- 3. Types --------------------------------------------------------------
   describe "column types round-trip through a model" do
     before(:each) do

@@ -96,22 +96,36 @@ module ActiveRecord
           @connection = database.connect
         end
 
-        # A bare `PRAGMA <name>` read (no `=`) -- how SQLite3Adapter's DDL and
-        # transaction-isolation code reads pragma state back (e.g.
-        # +disable_referential_integrity+'s `query_value("PRAGMA
-        # defer_foreign_keys")`, used by every alter_table-based schema
-        # change: add_column/remove_column/change_column/etc). libsql/turso
-        # does not track queryable state for every pragma it accepts as a
-        # setter -- +defer_foreign_keys+ and +read_uncommitted+ read back as
-        # an empty result set instead of a value, even right after being set.
+        # A bare read of exactly +defer_foreign_keys+ or +read_uncommitted+
+        # (no `=`) -- how SQLite3Adapter's DDL and transaction-isolation code
+        # reads their state back (e.g. +disable_referential_integrity+'s
+        # `query_value("PRAGMA defer_foreign_keys")`, used by every
+        # alter_table-based schema change: add_column/remove_column/
+        # change_column/etc). libsql/turso does not track queryable state for
+        # either of these two specific pragmas -- reading them back yields an
+        # empty result set instead of a value, even right after being set.
         # An empty result makes `query_value` return nil, which the caller
         # then interpolates into a follow-up statement
         # (`"PRAGMA defer_foreign_keys = #{nil}"`) -> invalid SQL ("incomplete
-        # input"). Every pragma SQLite3Adapter reads this way defaults to
-        # OFF/0, and this driver has no way to report a truer answer, so
-        # synthesize that default -- exactly analogous to the FK-enforcement
-        # bridge in +configure_connection+.
-        BARE_PRAGMA_READ_REGEX = /\A\s*PRAGMA\s+(\w+)\s*\z/i
+        # input"). Both default to OFF/0 per SQLite's docs, and this driver
+        # has no way to report a truer answer, so synthesize that default --
+        # exactly analogous to the FK-enforcement bridge in
+        # +configure_connection+.
+        #
+        # Deliberately NOT a generic `PRAGMA \w+` allowlist: `PRAGMA
+        # foreign_key_check` is also a bare, argument-less pragma read (via
+        # SQLite3Adapter#check_all_foreign_keys_valid!), but for it an EMPTY
+        # result is the *correct*, meaningful answer ("no FK violations") --
+        # synthesizing a fake row for it would make check_all_foreign_keys_valid!
+        # (called by ActiveRecord::FixtureSet when
+        # verify_foreign_keys_for_fixtures is on -- the Rails 7.1+ app-generator
+        # default) raise a false-positive "Foreign key violations found:" on
+        # perfectly clean data. Scoping the match to only the two pragmas
+        # actually root-caused here means any other bare pragma (including
+        # foreign_key_check) falls through to the real driver result instead
+        # of a synthesized one -- failing loudly on a genuine future gap
+        # rather than silently lying.
+        BARE_PRAGMA_READ_REGEX = /\A\s*PRAGMA\s+(defer_foreign_keys|read_uncommitted)\s*\z/i
         private_constant :BARE_PRAGMA_READ_REGEX
 
         # --- execution surface used by BeagleTursoAdapter#perform_query ---
