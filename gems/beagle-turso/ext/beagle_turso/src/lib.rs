@@ -165,6 +165,53 @@ impl RbConnection {
         }
         Ok(out)
     }
+
+    // Like `query`, but also returns column names — needed by callers (e.g.
+    // an ActiveRecord adapter) that must know column identity, not just
+    // positional values. Returns a 2-element `[columns, rows]` array;
+    // `rows` is built with the same loop `query` uses.
+    fn query_result(
+        ruby: &Ruby,
+        rb_self: &Self,
+        sql: String,
+        params: RArray,
+    ) -> Result<RArray, Error> {
+        let p = ruby_array_to_params(ruby, params)?;
+        let result = rb_self
+            .inner
+            .query_result(&sql, &p)
+            .map_err(|e| rt_err(ruby, e.to_string()))?;
+        let columns = ruby.ary_new();
+        for name in &result.columns {
+            columns.push(name.clone().into_value_with(ruby))?;
+        }
+        let rows = ruby.ary_new();
+        for row in result.rows {
+            let rb_row = ruby.ary_new();
+            for val in &row.values {
+                rb_row.push(value_to_ruby(ruby, val))?;
+            }
+            rows.push(rb_row)?;
+        }
+        let out = ruby.ary_new();
+        out.push(columns)?;
+        out.push(rows)?;
+        Ok(out)
+    }
+
+    fn last_insert_rowid(ruby: &Ruby, rb_self: &Self) -> Result<i64, Error> {
+        rb_self
+            .inner
+            .last_insert_rowid()
+            .map_err(|e| rt_err(ruby, e.to_string()))
+    }
+
+    fn execute_batch(ruby: &Ruby, rb_self: &Self, sql: String) -> Result<(), Error> {
+        rb_self
+            .inner
+            .execute_batch(&sql)
+            .map_err(|e| rt_err(ruby, e.to_string()))
+    }
 }
 
 #[magnus::init]
@@ -181,5 +228,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let conn = turso.define_class("Connection", ruby.class_object())?;
     conn.define_method("execute", method!(RbConnection::execute, 2))?;
     conn.define_method("query", method!(RbConnection::query, 2))?;
+    conn.define_method("query_result", method!(RbConnection::query_result, 2))?;
+    conn.define_method(
+        "last_insert_rowid",
+        method!(RbConnection::last_insert_rowid, 0),
+    )?;
+    conn.define_method("execute_batch", method!(RbConnection::execute_batch, 1))?;
     Ok(())
 }
