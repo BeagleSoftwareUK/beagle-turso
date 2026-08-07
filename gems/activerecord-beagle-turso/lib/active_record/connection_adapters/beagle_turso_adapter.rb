@@ -94,6 +94,7 @@ module ActiveRecord
         def initialize(database)
           @database   = database
           @connection = database.connect
+          @closed     = false
         end
 
         # A bare read of exactly +defer_foreign_keys+ or +read_uncommitted+
@@ -152,9 +153,19 @@ module ActiveRecord
           nil
         end
         # connected? => !(@raw_connection.nil? || @raw_connection.closed?)
-        def closed? = false
-        # beagle-turso has no explicit close; GC reclaims the native handle.
-        def close = nil
+        def closed? = @closed
+        # Release the beagle-turso session eagerly rather than waiting for GC.
+        # A *synced* Database holds a server-side sync session open; without an
+        # explicit close each ActiveRecord disconnect/reconnect (e.g.
+        # verify!/db:prepare) leaked one, accumulating on the remote until it
+        # reported "database is busy". Close the connection first, then the
+        # database (which ends the sync session). Idempotent.
+        def close
+          return if @closed
+          @closed = true
+          @connection.close
+          @database.close
+        end
         # SQLite3Adapter#reconnect calls this when reusing a live connection.
         def rollback = execute("ROLLBACK", [])
 
