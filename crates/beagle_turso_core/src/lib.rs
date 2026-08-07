@@ -151,7 +151,7 @@ impl Database {
     }
 
     pub fn connect(&self) -> Result<Connection> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let inner = guard.as_ref().ok_or(Error::Closed)?;
         let conn = match inner {
             Inner::Local(db) => db.connect().map_err(|e| Error::Connect(e.to_string()))?,
@@ -170,7 +170,7 @@ impl Database {
     /// Push local changes to the remote. Errors if this database is
     /// local-only (opened without `remote_url`/`auth_token`).
     pub fn push(&self) -> Result<()> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let inner = guard.as_ref().ok_or(Error::Closed)?;
         match inner {
             Inner::Local(_) => Err(Error::Sync("push() on a local-only database".into())),
@@ -186,7 +186,7 @@ impl Database {
     /// Errors if this database is local-only (opened without
     /// `remote_url`/`auth_token`).
     pub fn pull(&self) -> Result<bool> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let inner = guard.as_ref().ok_or(Error::Closed)?;
         match inner {
             Inner::Local(_) => Err(Error::Sync("pull() on a local-only database".into())),
@@ -202,14 +202,19 @@ impl Database {
     /// Idempotent. After close, [`Database::connect`]/[`Database::push`]/
     /// [`Database::pull`] return [`Error::Closed`].
     ///
-    /// The `turso` crate (v0.7.x) exposes no explicit async `close`/`shutdown`
-    /// on `sync::Database`/`Connection`; teardown is via `Drop`. Dropping the
-    /// last handle drops the internal `Arc<TursoDatabaseSync>`, which breaks
-    /// the sync IO worker loop and frees the sync engine — that is what ends
-    /// the server-side session. We drop the `Inner` INSIDE `rt.block_on` so a
-    /// live Tokio reactor is in scope for any async teardown that runs on drop.
+    /// The `turso` crate (v0.7.2) exposes no explicit async `close`/`shutdown`
+    /// on `sync::Database`/`Connection`; teardown is via `Drop`. A synced
+    /// `turso::sync::Database` runs its IO on an independent worker thread that
+    /// holds only a `Weak` reference to the sync engine; dropping the last
+    /// strong handle (our `Inner`) closes the worker's mpsc channel and lets
+    /// its `Weak::upgrade` fail, so the worker loop exits and the sync engine
+    /// is released — that is what ends the server-side session. turso 0.7.2 has
+    /// no custom `Drop` that touches the *current* runtime, so the
+    /// `block_on(async move { drop(inner) })` below has no await and resolves
+    /// immediately; it is kept purely as a harmless defensive wrapper (a live
+    /// reactor is in scope if a future turso version ever needs one on drop).
     pub fn close(&self) {
-        let inner = self.inner.lock().unwrap().take();
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
         if inner.is_some() {
             self.rt.block_on(async move { drop(inner) });
         }
@@ -217,13 +222,25 @@ impl Database {
 
     /// Whether this database has been closed (see [`Database::close`]).
     pub fn is_closed(&self) -> bool {
-        self.inner.lock().unwrap().is_none()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+}
+
+impl Drop for Database {
+    /// Backstop: a consumer that drops the handle without calling
+    /// [`Database::close`] still releases the session uniformly. Idempotent
+    /// with an explicit prior close (`close` no-ops once `inner` is `None`).
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
 impl Connection {
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         self.rt.block_on(async {
@@ -241,7 +258,7 @@ impl Connection {
     /// names — needed by callers (e.g. an ActiveRecord adapter) that must
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         self.rt.block_on(async {
@@ -275,7 +292,7 @@ impl Connection {
     /// method's signature for API consistency with the rest of `Connection`,
     /// even though the underlying call cannot fail.
     pub fn last_insert_rowid(&self) -> Result<i64> {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         Ok(conn.last_insert_rowid())
     }
@@ -288,7 +305,7 @@ impl Connection {
     /// `;` — so statements containing `;` inside string literals (e.g.
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         self.rt.block_on(async {
             conn.execute_batch(sql)
@@ -301,10 +318,11 @@ impl Connection {
     /// handle instead of waiting for GC. Idempotent. After close, the
     /// execution methods return [`Error::Closed`].
     ///
-    /// As with [`Database::close`], the handle is dropped inside `rt.block_on`
-    /// so a Tokio reactor is live for any teardown that runs on drop.
+    /// As with [`Database::close`], the drop happens inside `rt.block_on` only
+    /// as a harmless defensive wrapper — turso 0.7.2's `Connection` has no
+    /// custom `Drop` that awaits, so this resolves immediately.
     pub fn close(&self) {
-        let conn = self.conn.lock().unwrap().take();
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner()).take();
         if conn.is_some() {
             self.rt.block_on(async move { drop(conn) });
         }
@@ -312,6 +330,18 @@ impl Connection {
 
     /// Whether this connection has been closed (see [`Connection::close`]).
     pub fn is_closed(&self) -> bool {
-        self.conn.lock().unwrap().is_none()
+        self.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+}
+
+impl Drop for Connection {
+    /// Backstop mirroring [`Database`]'s: dropping a `Connection` without an
+    /// explicit [`Connection::close`] still releases the handle uniformly.
+    /// Idempotent with a prior close.
+    fn drop(&mut self) {
+        self.close();
     }
 }

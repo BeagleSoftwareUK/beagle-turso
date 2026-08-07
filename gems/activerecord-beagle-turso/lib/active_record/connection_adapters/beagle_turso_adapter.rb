@@ -160,11 +160,21 @@ module ActiveRecord
         # verify!/db:prepare) leaked one, accumulating on the remote until it
         # reported "database is busy". Close the connection first, then the
         # database (which ends the sync session). Idempotent.
+        #
+        # @closed is only flipped true AFTER both closes have run: if
+        # @connection.close raised and we had set @closed up front, the ensure'd
+        # @database.close would be skipped yet closed? would already report true
+        # -- the session would leak silently (SQLite3Adapter#disconnect! swallows
+        # the exception). The ensure guarantees the database (session) close runs
+        # even if the connection close raises, and @closed reflects reality.
         def close
           return if @closed
-          @closed = true
-          @connection.close
-          @database.close
+          begin
+            @connection.close
+          ensure
+            @database.close
+            @closed = true
+          end
         end
         # SQLite3Adapter#reconnect calls this when reusing a live connection.
         def rollback = execute("ROLLBACK", [])
