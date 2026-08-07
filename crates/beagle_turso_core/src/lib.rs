@@ -80,6 +80,13 @@ pub struct Row {
     pub values: Vec<Value>,
 }
 
+/// The full result of a [`Connection::query_result`] call: column names
+/// alongside the rows, since [`Row`] alone carries no column metadata.
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Row>,
+}
+
 /// The underlying engine handle: local-only, or synced with a remote Turso
 /// database via push/pull.
 enum Inner {
@@ -182,6 +189,13 @@ impl Connection {
     }
 
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        Ok(self.query_result(sql, params)?.rows)
+    }
+
+    /// Like [`Connection::query`], but also captures the result set's column
+    /// names — needed by callers (e.g. an ActiveRecord adapter) that must
+    /// know column identity, not just positional values.
+    pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         self.rt.block_on(async {
             let mut rows = self
@@ -189,6 +203,10 @@ impl Connection {
                 .query(sql, tparams)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?;
+            // turso::Rows::column_names() reads column metadata off the
+            // prepared statement, so it's available up front (no need to
+            // step first) and stays fixed across the whole result set.
+            let columns = rows.column_names();
             let mut out = Vec::new();
             while let Some(row) = rows.next().await.map_err(|e| Error::Query(e.to_string()))? {
                 let n = row.column_count();
@@ -199,7 +217,7 @@ impl Connection {
                 }
                 out.push(Row { values: vals });
             }
-            Ok(out)
+            Ok(QueryResult { columns, rows: out })
         })
     }
 }

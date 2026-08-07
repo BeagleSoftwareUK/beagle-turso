@@ -48,3 +48,22 @@ fn params_bind_all_value_kinds() {
     assert_eq!(rows[0].values[3], Value::Blob(vec![1, 2, 3]));
     assert_eq!(rows[0].values[4], Value::Null);
 }
+
+#[test]
+fn query_result_exposes_column_names() {
+    let db = Database::open(OpenOptions::default()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t (id, name) VALUES (?, ?)",
+        &[Value::Integer(1), Value::Text("a".into())],
+    )
+    .unwrap();
+    let r = conn.query_result("SELECT id, name FROM t", &[]).unwrap();
+    assert_eq!(r.columns, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(
+        r.rows[0].values,
+        vec![Value::Integer(1), Value::Text("a".into())]
+    );
+}
