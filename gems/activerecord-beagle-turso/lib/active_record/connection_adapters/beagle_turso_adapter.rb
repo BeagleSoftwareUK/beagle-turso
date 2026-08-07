@@ -16,21 +16,48 @@ module ActiveRecord
     # Everything ActiveRecord relies on above the raw connection -- SQL
     # generation, quoting, schema introspection (PRAGMA table_xinfo,
     # sqlite_master), type mapping, transactions -- is inherited unchanged from
-    # SQLite3Adapter. We swap out three things:
+    # SQLite3Adapter. We swap out:
     #
-    #   * +new_client+ / +connect+ : open a Beagle::Turso::Database instead of a
+    #   * +new_client+ / +connect+   : open a Beagle::Turso::Database instead of a
     #     ::SQLite3::Database, wrapped in a Client that answers the handful of
     #     lifecycle/pragma messages the SQLite3Adapter sends a raw connection.
-    #   * +perform_query+          : the single method every query flows through
+    #   * +configure_connection+     : re-assert `PRAGMA foreign_keys = ON` through
+    #     the real exec path, because the stock DEFAULT_PRAGMA setter is a no-op on
+    #     our Client (SQLite defaults FKs OFF per-connection).
+    #   * +perform_query+            : the single method every query flows through
     #     (see AbstractAdapter#raw_execute). Reads/RETURNING -> ActiveRecord::Result
-    #     with columns+rows; writes -> affected-row count + last_insert_rowid.
-    #   * +last_inserted_id+       : fall back to last_insert_rowid when a plain
+    #     with columns+rows; writes (incl. data-modifying CTEs) -> affected-row
+    #     count + last_insert_rowid.
+    #   * +last_inserted_id+         : fall back to last_insert_rowid when a plain
     #     INSERT (no RETURNING) was used.
     class BeagleTursoAdapter < SQLite3Adapter
       ADAPTER_NAME = "BeagleTurso"
 
+      # A RETURNING clause makes any write yield rows, so it routes to the read
+      # (query_result) branch.
       RETURNING_REGEX = /\bRETURNING\b/i
       private_constant :RETURNING_REGEX
+
+      # A data-modifying CTE: a leading WITH whose *main* statement -- the token
+      # right after the CTE definition list's closing paren -- is INSERT / UPDATE
+      # / DELETE. AR's write_query? classifies any leading WITH as a READ, so
+      # without this such writes would be routed to query_result: the change still
+      # persists, but the affected-row count comes back nil and a CTE-INSERT's
+      # rowid is lost. The `\)\s*` anchor is deliberate -- it keeps `WITH ... SELECT`
+      # reads (and DML keywords that appear inside string literals or identifiers)
+      # from being misclassified as writes.
+      #
+      # Residual limitation: this is a heuristic, not a full SQL parse. A
+      # data-modifying CTE whose main verb is not immediately preceded by the CTE
+      # list's closing `)` (extremely unusual) could be missed, and a read CTE
+      # containing the literal text `) UPDATE`/`) INSERT`/`) DELETE` could be
+      # mis-routed. The read branch also re-captures last_insert_rowid whenever the
+      # SQL mentions INSERT, so an inserted id is never silently lost even on a miss.
+      DATA_MODIFYING_CTE_REGEX = /\A\s*WITH\b[\s\S]*\)\s*(?:INSERT|UPDATE|DELETE)\b/i
+      private_constant :DATA_MODIFYING_CTE_REGEX
+
+      INSERT_REGEX = /\bINSERT\b/i
+      private_constant :INSERT_REGEX
 
       class << self
         # Open a beagle-turso Database (synced remote when +remote_url+ is
@@ -115,13 +142,18 @@ module ActiveRecord
             if batch
               raw_connection.execute_batch(sql)
               ::ActiveRecord::Result.empty
-            elsif returning_query?(sql)
-              columns, rows = raw_connection.query_result(sql, params)
-              ::ActiveRecord::Result.new(columns, rows)
-            else
+            elsif write_statement?(sql)
               affected = raw_connection.execute(sql, params)
               @last_inserted_rowid = raw_connection.last_insert_rowid
               ::ActiveRecord::Result.empty(affected_rows: affected)
+            else
+              columns, rows = raw_connection.query_result(sql, params)
+              # Belt-and-suspenders: a RETURNING insert lands here (id read from
+              # rows by last_inserted_id), and a data-modifying CTE that slips past
+              # write_statement? would too -- keep the rowid so an inserted id is
+              # never silently lost even on a heuristic miss.
+              @last_inserted_rowid = raw_connection.last_insert_rowid if INSERT_REGEX.match?(sql)
+              ::ActiveRecord::Result.new(columns, rows)
             end
 
           verified!
@@ -130,12 +162,20 @@ module ActiveRecord
           result
         end
 
-        # A statement returns rows when it is a read (SELECT/PRAGMA/WITH/...,
-        # decided by SQLite3's own read/write classifier) or when it carries a
-        # RETURNING clause (INSERT/UPDATE/DELETE ... RETURNING). write_query? is
-        # a pure predicate here, so calling it a second time is side-effect free.
-        def returning_query?(sql)
-          !write_query?(sql) || RETURNING_REGEX.match?(sql)
+        # Route to the WRITE branch (execute -> affected count + last_insert_rowid)
+        # rather than the read branch. A statement is a write when SQLite3's own
+        # read/write classifier says so, OR when it is a data-modifying CTE that
+        # the classifier misreads as a read (see DATA_MODIFYING_CTE_REGEX). A
+        # RETURNING clause always yields rows, so it goes to the read branch even
+        # though it mutates. write_query? is a pure predicate here, so calling it a
+        # second time is side-effect free.
+        def write_statement?(sql)
+          return false if RETURNING_REGEX.match?(sql)
+          write_query?(sql) || data_modifying_cte?(sql)
+        end
+
+        def data_modifying_cte?(sql)
+          DATA_MODIFYING_CTE_REGEX.match?(sql)
         end
 
         # For INSERT ... RETURNING "id" the id arrives in the result rows (super).
@@ -149,6 +189,20 @@ module ActiveRecord
         # without its ::SQLite3-specific ConnectionNotEstablished rescue.
         def connect
           @raw_connection = self.class.new_client(@connection_parameters)
+        end
+
+        # SQLite disables foreign keys per-connection by default; stock
+        # SQLite3Adapter turns them on via `raw_connection.foreign_keys = true`
+        # (a DEFAULT_PRAGMA setter). On our Client that setter is a swallowed
+        # no-op, so FK enforcement would silently be OFF -- a regression vs the
+        # stock adapter. Re-assert it here through the real exec path.
+        #
+        # `super` still runs (check_version + the other DEFAULT_PRAGMA setters);
+        # journal_mode/synchronous/mmap_size are moot for in-memory and remote
+        # libsql, so leaving those as no-ops is fine.
+        def configure_connection
+          super
+          @raw_connection.execute("PRAGMA foreign_keys = ON", [])
         end
     end
   end
