@@ -1,0 +1,34 @@
+name: adapter
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.3"
+          rustup-toolchain: stable
+          bundler-cache: true
+          cargo-cache: true
+          working-directory: gems/beagle-turso
+      # activerecord-beagle-turso's Gemfile pulls in beagle-turso as a `path:`
+      # dependency (../beagle-turso), which has a native (Rust) extension.
+      # Bundler does NOT compile a path gem's extension as part of
+      # `bundle install` (confirmed by hand: deleting the built .so and
+      # re-running `bundle install` from the adapter gem's own directory does
+      # not rebuild it) -- it has to be compiled here explicitly first, the
+      # same way gem.yml builds it for beagle-turso's own CI.
+      - run: bundle install
+        working-directory: gems/beagle-turso
+      - run: bundle exec rake compile
+        working-directory: gems/beagle-turso
+      - run: bundle install
+        working-directory: gems/activerecord-beagle-turso
+      # Runs all specs, including spec/dummy_app_integration_spec.rb (boots
+      # test/dummy, a real Rails::Application, and runs a migration + model
+      # CRUD through it). spec/sync_manager_spec.rb's real-Turso round trip
+      # SKIPs cleanly without TURSO_DATABASE_URL/TURSO_AUTH_TOKEN -- no creds
+      # are provided in CI, and none should ever be logged.
+      - run: bundle exec rspec
+        working-directory: gems/activerecord-beagle-turso

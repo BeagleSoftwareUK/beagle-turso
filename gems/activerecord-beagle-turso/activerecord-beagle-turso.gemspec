@@ -32,4 +32,10 @@ Gem::Specification.new do |spec|
   spec.add_dependency "sqlite3", ">= 2.1"
 
   spec.add_development_dependency "rspec", "~> 3.13"
+  # Only for test/dummy (the real-Rails-boot integration spec, Task 7).
+  # railties pulls in actionpack/actionview transitively -- ActiveRecord::Railtie
+  # itself hard-requires action_controller/railtie, so there is no lighter-weight
+  # way to boot a genuine Rails::Application. Adapter production use has no
+  # dependency on any of this.
+  spec.add_development_dependency "railties", "~> 8.1"
 end

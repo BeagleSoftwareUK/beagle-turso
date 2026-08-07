@@ -1,0 +1,7 @@
+# Only a `test:` entry -- this dummy app only ever boots with RAILS_ENV=test
+# (see spec/dummy_app_integration_spec.rb). `:memory:` mirrors the rest of
+# this gem's spec suite: a fresh, local, non-synced Turso database, so this
+# integration test needs no credentials and leaves no files behind.
+test:
+  adapter: beagle_turso
+  database: ":memory:"
