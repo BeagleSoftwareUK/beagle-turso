@@ -2,3 +2,5 @@
 
 require "activerecord/beagle_turso/version"
 require "active_record/connection_adapters/beagle_turso_adapter"
+require "active_record/connection_adapters/beagle_turso/sync_manager"
+require "active_record/connection_adapters/beagle_turso/sync_job"

@@ -22,7 +22,7 @@ Gem::Specification.new do |spec|
 
   spec.metadata["source_code_uri"] = "https://github.com/BeagleSoftwareUK/beagle-turso"
 
-  spec.files         = Dir["lib/**/*.rb"]
+  spec.files         = Dir["lib/**/*.rb"] + Dir["config/*.example"]
   spec.require_paths = ["lib"]
 
   spec.add_dependency "activerecord", "~> 8.1"

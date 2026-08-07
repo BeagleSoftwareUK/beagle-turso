@@ -1,0 +1,22 @@
+# Example Solid Queue recurring-job entry for ActiveRecord::ConnectionAdapters::BeagleTurso::SyncJob.
+#
+# This is NOT loaded by this gem -- copy the relevant environment block(s)
+# into your host Rails app's own config/recurring.yml (Solid Queue reads
+# that file; see the solid_queue README for the full recurring.yml format).
+# Only add this for environments whose database.yml connection is actually
+# synced (has both remote_url: and auth_token: -- see
+# lib/active_record/connection_adapters/beagle_turso/sync_manager.rb). A
+# recurring SyncJob against a local-only connection will fail every run with
+# Beagle::Turso::SyncManager::NotSyncedError.
+#
+# Keep the `schedule:` cadence here in sync (by hand) with whatever
+# `sync_interval:` you documented in database.yml for the same environment --
+# Solid Queue does not read database.yml, so there is no single source of
+# truth to enforce this automatically.
+
+production:
+  beagle_turso_sync:
+    class: ActiveRecord::ConnectionAdapters::BeagleTurso::SyncJob
+    queue: default
+    # Match database.yml's production `sync_interval:` for this connection.
+    schedule: every 30 seconds
