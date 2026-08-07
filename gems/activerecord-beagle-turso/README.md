@@ -204,6 +204,28 @@ step is a separately-scoped effort to vendor the full Rails source at a
 pinned tag and run its adapter suite in CI — not a partial port bolted onto
 this gem.
 
+## Limitations (v1)
+
+1. **Uncast raw/computed SELECT values.** Reads go through `ActiveRecord::Result`
+   without result column types, so ordinary model attributes and `pluck(:column)`
+   cast correctly, but a raw/computed SELECT expression with no backing attribute
+   (e.g. `select_all("SELECT some_datetime_expr ...")`, `pluck(Arel.sql("..."))`)
+   may come back uncast (string / 0/1 instead of Time / boolean). Cast such values
+   yourself.
+
+2. **Data-modifying CTEs and read-replica write-guards.** A hand-written
+   `WITH ... UPDATE/INSERT/DELETE` executes correctly, but is classified as a read
+   by ActiveRecord's write-guard layer — so under `connected_to(role: :reading)` it
+   won't trip the read-only guard, and it won't mark the transaction dirty. Use
+   plain `UPDATE`/`DELETE` (or `Model.update_all`/`delete_all`) if you rely on
+   read/write splitting.
+
+3. **Sync holds the GVL.** `SyncManager.push!`/`pull!` block Ruby's GVL for the
+   full network round-trip. Under `SOLID_QUEUE_IN_PUMA=true` (jobs in the Puma
+   process), a recurring `SyncJob` stalls all Puma threads for the duration of
+   each sync — pick a sync cadence accordingly, or run Solid Queue in a separate
+   process.
+
 ## License
 
 [MIT](https://opensource.org/licenses/MIT).
