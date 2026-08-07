@@ -96,8 +96,34 @@ module ActiveRecord
           @connection = database.connect
         end
 
+        # A bare `PRAGMA <name>` read (no `=`) -- how SQLite3Adapter's DDL and
+        # transaction-isolation code reads pragma state back (e.g.
+        # +disable_referential_integrity+'s `query_value("PRAGMA
+        # defer_foreign_keys")`, used by every alter_table-based schema
+        # change: add_column/remove_column/change_column/etc). libsql/turso
+        # does not track queryable state for every pragma it accepts as a
+        # setter -- +defer_foreign_keys+ and +read_uncommitted+ read back as
+        # an empty result set instead of a value, even right after being set.
+        # An empty result makes `query_value` return nil, which the caller
+        # then interpolates into a follow-up statement
+        # (`"PRAGMA defer_foreign_keys = #{nil}"`) -> invalid SQL ("incomplete
+        # input"). Every pragma SQLite3Adapter reads this way defaults to
+        # OFF/0, and this driver has no way to report a truer answer, so
+        # synthesize that default -- exactly analogous to the FK-enforcement
+        # bridge in +configure_connection+.
+        BARE_PRAGMA_READ_REGEX = /\A\s*PRAGMA\s+(\w+)\s*\z/i
+        private_constant :BARE_PRAGMA_READ_REGEX
+
         # --- execution surface used by BeagleTursoAdapter#perform_query ---
-        def query_result(sql, params) = connection.query_result(sql, params)
+        def query_result(sql, params)
+          columns, rows = connection.query_result(sql, params)
+          if columns.empty? && rows.empty? && (match = BARE_PRAGMA_READ_REGEX.match(sql))
+            [[match[1]], [[0]]]
+          else
+            [columns, rows]
+          end
+        end
+
         def execute(sql, params)      = connection.execute(sql, params)
         def execute_batch(sql)        = connection.execute_batch(sql)
         def last_insert_rowid         = connection.last_insert_rowid
