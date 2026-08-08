@@ -10,9 +10,19 @@
 # past this (member-less) directory to the repo root workspace — which no
 # longer lists the ext — and rb_sys would raise `PackageNotFoundError`.
 # Declaring this small workspace here gives Cargo something to find right
-# away, independent of the root workspace. The ext still resolves its
-# `beagle_turso_core` path dependency normally regardless of which
-# workspace it belongs to.
+# away, independent of the root workspace.
+#
+# Because this file (not the repo root's) is the workspace Cargo actually
+# resolves the ext against, it needs its OWN [patch.crates-io]: the ext's
+# `beagle_turso_core` dependency now names a published version ("0.1.0", see
+# ext/beagle_turso/Cargo.toml) so packaged/published gems resolve it from
+# crates.io, but in-repo builds (rake compile, rspec, gem build) must still
+# use the local crate. The repo root's [patch.crates-io] does NOT reach here
+# -- Cargo's upward workspace search stops at the first `[workspace]` table
+# it finds (this one), so it never continues on to inspect the root's patch.
 [workspace]
 resolver = "2"
 members = ["ext/beagle_turso"]
+
+[patch.crates-io]
+beagle_turso_core = { path = "../../crates/beagle_turso_core" }

@@ -11,3 +11,12 @@
 resolver = "2"
 members = ["crates/beagle_turso_core"]
 exclude = ["spikes", "gems/beagle-turso/ext/beagle_turso"]
+
+# The ext crate (excluded above) now depends on a *published* beagle_turso_core
+# version ("0.1.0") so packaged/published gems resolve it from crates.io. This
+# patch redirects that dependency back to the in-repo crate for all in-repo
+# builds/tests (cargo build/test, rake compile, rspec), so local development
+# never needs the crate to actually be published. Remove only if the ext ever
+# drops its path-based in-repo development story entirely.
+[patch.crates-io]
+beagle_turso_core = { path = "crates/beagle_turso_core" }
