@@ -118,15 +118,17 @@ jobs:
           set -e
 
           push_idempotent() {
-            # Uses push.err (not publish.err -- that name belongs to the
-            # crate-publish job's own error file) so a re-run of this job
-            # never confuses the two.
-            if gem push "$1" 2>push.err; then
-              echo "pushed $1"
-            elif grep -qiE "already been pushed|Repushing" push.err; then
-              echo "already pushed $1 — skipping"; cat push.err
+            # Capture COMBINED stdout+stderr (push.log): `gem push` prints its
+            # duplicate-version rejection ("Repushing of gem versions is not
+            # allowed") to STDOUT, not stderr, so a stderr-only capture would
+            # miss it and hard-fail a re-run on already-published gems. push.log
+            # (not publish.err) keeps this distinct from the crate-publish job.
+            if gem push "$1" >push.log 2>&1; then
+              echo "pushed $1"; cat push.log
+            elif grep -qiE "already been pushed|Repushing" push.log; then
+              echo "already pushed $1 — skipping"; cat push.log
             else
-              cat push.err
+              cat push.log
               return 1
             fi
           }
