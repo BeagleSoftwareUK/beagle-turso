@@ -20,13 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@v1.0.5
         id: auth
       - name: Publish beagle_turso_core (skip if version already on crates.io)
         run: |
           if cargo publish -p beagle_turso_core 2>publish.err; then
             echo "published"
-          elif grep -q "already exists" publish.err; then
+          elif grep -qE "already (uploaded|exists)" publish.err; then
             echo "already published — skipping"; cat publish.err
           else
             cat publish.err; exit 1
