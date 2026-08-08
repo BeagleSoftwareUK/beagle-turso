@@ -1,7 +1,16 @@
 require "rake/extensiontask"
 require "rb_sys/extensiontask"
 
-RbSys::ExtensionTask.new("beagle_turso") do |ext|
+# The gemspec MUST be passed to ExtensionTask (not just the crate name) --
+# Rake::ExtensionTask#define only defines the `native`/`native:<platform>`
+# packaging tasks when @gem_spec is present and its platform is "ruby" (see
+# rake-compiler's lib/rake/extensiontask.rb). Without it, `rake compile`
+# still works for local dev, but `rake native:<platform> gem` -- what
+# rb-sys-dock / oxidize-rb's cross-gem action actually invokes -- fails with
+# "Don't know how to build task 'native:<platform>'".
+GEMSPEC = Gem::Specification.load(File.expand_path("beagle-turso.gemspec", __dir__))
+
+RbSys::ExtensionTask.new("beagle_turso", GEMSPEC) do |ext|
   ext.lib_dir = "lib/beagle_turso"
 end
 
