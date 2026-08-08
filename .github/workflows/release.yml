@@ -70,7 +70,7 @@ jobs:
         id: cross-gem
         with:
           platform: ${{ matrix.platform }}
-          ruby-versions: "3.3,3.4"
+          ruby-versions: "3.3,3.4,4.0"
           working-directory: gems/beagle-turso
       - uses: actions/upload-artifact@v7
         with:
