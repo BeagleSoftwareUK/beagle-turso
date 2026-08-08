@@ -1,0 +1,117 @@
+name: release
+
+# Tag-triggered release pipeline: publish the crate to crates.io, then
+# cross-compile + publish the precompiled and source gems to RubyGems.
+# Everything auths via OIDC trusted publishing -- no registry tokens are
+# stored anywhere in this repo or as GitHub secrets.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # --- 1. Crate first: the gems' native ext depends on the published
+  # beagle_turso_core version (see Cargo.toml [patch.crates-io] comments),
+  # so it must exist on crates.io before any gem cross-compile can resolve it.
+  publish-crate:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # crates.io trusted publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish beagle_turso_core (skip if version already on crates.io)
+        run: |
+          if cargo publish -p beagle_turso_core 2>publish.err; then
+            echo "published"
+          elif grep -q "already exists" publish.err; then
+            echo "already published — skipping"; cat publish.err
+          else
+            cat publish.err; exit 1
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # --- 2. Precompiled platform gems, one job per platform (fail-fast off so
+  # one platform's cross-compile failure doesn't cancel the others).
+  cross-gems:
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux
+          - aarch64-linux
+          - x86_64-linux-musl
+          - arm64-darwin
+          - x86_64-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.3"
+          rustup-toolchain: stable
+          bundler-cache: true
+          cargo-cache: true
+          working-directory: gems/beagle-turso
+      # oxidize-rb/cross-gem-action is archived upstream; the maintainers'
+      # replacement is oxidize-rb/actions/cross-gem (same platform /
+      # ruby-versions / working-directory inputs, verified against its
+      # current readme.md).
+      - uses: oxidize-rb/actions/cross-gem@v1
+        id: cross-gem
+        with:
+          platform: ${{ matrix.platform }}
+          ruby-versions: "3.3,3.4"
+          working-directory: gems/beagle-turso
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cross-gem-${{ matrix.platform }}
+          path: ${{ steps.cross-gem.outputs.gem-path }}
+
+  # --- 3. Source gems (both packages) -- the fallback install path for any
+  # platform not covered by the cross-compile matrix above.
+  source-gem:
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: "3.3" }
+      - run: gem build beagle-turso.gemspec
+        working-directory: gems/beagle-turso
+      - run: gem build activerecord-beagle-turso.gemspec
+        working-directory: gems/activerecord-beagle-turso
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source-gems
+          path: |
+            gems/beagle-turso/*.gem
+            gems/activerecord-beagle-turso/*.gem
+
+  # --- 4. Publish everything to RubyGems via OIDC trusted publishing.
+  # beagle-turso (platform + source gems) must land before
+  # activerecord-beagle-turso, which depends on it ("~> 0.1").
+  publish-gems:
+    needs: [cross-gems, source-gem]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # RubyGems trusted publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: "3.3" }
+      - uses: actions/download-artifact@v8
+        with: { path: dist, merge-multiple: true }
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
+      - name: Push beagle-turso (platform gems + source), then the adapter
+        run: |
+          set -e
+          # beagle-turso platform + source gems first (adapter depends on it)
+          for g in dist/beagle-turso-*.gem; do gem push "$g"; done
+          # then the pure-Ruby adapter
+          for g in dist/activerecord-beagle-turso-*.gem; do gem push "$g"; done
