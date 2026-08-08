@@ -80,12 +80,17 @@ or left as an explicit best-effort. Watch for these specifically:
 ## 3. Verify
 
 - crates.io: <https://crates.io/crates/beagle_turso_core> shows `0.1.0`.
-- `gem list -r beagle-turso --all` shows `0.1.0`; `gem list -r beagle-turso
-  --platform` (or the RubyGems web page for the gem) shows which precompiled
-  platforms actually landed — cross-check this against the "things to
-  confirm" list above (`aarch64-linux` and `x86_64-linux-musl` must be
-  present; `arm64-darwin`/`x86_64-darwin` are nice-to-have).
-- `gem list -r activerecord-beagle-turso --all` shows `0.1.0`.
+- `gem list -r -e beagle-turso --all` shows `0.1.0` (the `-e`/`--exact` flag
+  matters — without it, `gem list` does unanchored substring matching and the
+  output also picks up `activerecord-beagle-turso`). The same command's
+  output lists the published platforms inline on the version line (e.g.
+  `0.1.0 ruby aarch64-linux x86_64-linux ...`) — no separate `--platform`
+  flag exists for `gem list`. Cross-check the platform list against the
+  "things to confirm" list above (`aarch64-linux` and `x86_64-linux-musl`
+  must be present; `arm64-darwin`/`x86_64-darwin` are nice-to-have); the
+  RubyGems web page for the gem shows the same platform breakdown if you'd
+  rather read it there.
+- `gem list -r -e activerecord-beagle-turso --all` shows `0.1.0`.
 - On a supported platform: `gem install beagle-turso` pulls a precompiled gem
   (no `cargo`/`rustc` invoked — watch the install output for a compile step,
   which would mean it silently fell back to the source gem instead of a
@@ -119,8 +124,21 @@ or left as an explicit best-effort. Watch for these specifically:
 
 ## Rollback
 
-- **A bad gem version**: `gem yank beagle-turso -v 0.1.0` (and the adapter,
-  `gem yank activerecord-beagle-turso -v 0.1.0`, if it's also affected).
+- **A bad gem version**: `gem yank beagle-turso -v 0.1.0` with no
+  `--platform` only yanks the *source* (`ruby`-platform) gem — every
+  precompiled platform build stays live and installable, including
+  whichever one is ripponden_app's actual deploy target (`aarch64-linux`).
+  Yank every platform that actually published, explicitly:
+  ```
+  # List what actually published, then yank each platform shown:
+  gem list -r -e beagle-turso --all
+  gem yank beagle-turso -v 0.1.0 --platform ruby
+  gem yank beagle-turso -v 0.1.0 --platform aarch64-linux
+  gem yank beagle-turso -v 0.1.0 --platform x86_64-linux
+  gem yank beagle-turso -v 0.1.0 --platform x86_64-linux-musl
+  # ...and any darwin platforms that built (arm64-darwin / x86_64-darwin)
+  gem yank activerecord-beagle-turso -v 0.1.0   # pure-Ruby, single platform — fine as-is
+  ```
   ripponden_app can stay pinned to the `github:` source (i.e. don't do the
   Gemfile switch in section 4, or revert it if already done) until a fixed
   version ships.
