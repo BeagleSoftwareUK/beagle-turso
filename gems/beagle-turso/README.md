@@ -79,6 +79,30 @@ called; `push` is not called automatically after every write. Until a
 `push` succeeds, a write that's durable locally is not yet visible to other
 replicas of the same remote database.
 
+## Which Turso database?
+
+Point a synced database at a Turso database **dedicated to this engine** —
+ideally a fresh, empty one. On first open of an empty local replica,
+`bootstrap_if_empty` pulls the remote down; against a fresh remote that's a
+clean start, and the engine then manages its own state in that database (it
+creates `turso_cdc`, `__turso_internal_*`, and `turso_sync_last_change_id`
+tables and takes an **exclusive lock** on the local replica file — only one
+OS process may hold a given replica open at a time).
+
+Two things to avoid:
+
+- **Don't co-host a synced database with the legacy libSQL/Hrana driver.**
+  This engine (Turso's newer Rust core) and the classic libSQL client have
+  different write/sync models; running both against the same remote database
+  at once risks corrupting its sync state. Give this engine its own database.
+- **Migrating an existing, populated libSQL database into the synced engine
+  is not validated.** A fresh database is the supported, tested path. If you
+  must adopt existing data, treat it as unproven — test push/pull round-trips
+  before relying on it.
+
+A single remote database, dedicated to this engine and written by one process
+at a time, is the model it's built for.
+
 ## Credential safety
 
 `auth_token` is never included in `inspect` output or in error messages —
