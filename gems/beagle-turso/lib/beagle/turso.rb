@@ -1,5 +1,14 @@
 require_relative "turso/version"
-require "beagle_turso/beagle_turso" # native extension
+
+# Load the native extension. Precompiled ("fat") gems ship the .so under a
+# per-Ruby-ABI subdir (lib/beagle_turso/<major.minor>/beagle_turso.so); a
+# source build (dev, or the source-fallback gem) puts it flat at
+# lib/beagle_turso/beagle_turso.so. Try the versioned path first, fall back.
+begin
+  require "beagle_turso/#{RUBY_VERSION[/\d+\.\d+/]}/beagle_turso"
+rescue LoadError
+  require "beagle_turso/beagle_turso"
+end
 
 module Beagle
   module Turso
