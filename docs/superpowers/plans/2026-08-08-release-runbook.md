@@ -86,8 +86,9 @@ or left as an explicit best-effort. Watch for these specifically:
   output lists the published platforms inline on the version line (e.g.
   `0.1.0 ruby aarch64-linux x86_64-linux ...`) — no separate `--platform`
   flag exists for `gem list`. Cross-check the platform list against the
-  "things to confirm" list above (`aarch64-linux` and `x86_64-linux-musl`
-  must be present; `arm64-darwin`/`x86_64-darwin` are nice-to-have); the
+  "things to confirm" list above (`aarch64-linux`, `x86_64-linux`, and
+  `x86_64-linux-musl` must be present; `arm64-darwin`/`x86_64-darwin` are
+  nice-to-have); the
   RubyGems web page for the gem shows the same platform breakdown if you'd
   rather read it there.
 - `gem list -r -e activerecord-beagle-turso --all` shows `0.1.0`.

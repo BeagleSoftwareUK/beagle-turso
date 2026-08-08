@@ -8,6 +8,11 @@ on:
   push:
     tags: ["v*"]
 
+# Least-privilege default for every job; the two publishing jobs below
+# override this with the extra `id-token: write` OIDC grant they need.
+permissions:
+  contents: read
+
 jobs:
   # --- 1. Crate first: the gems' native ext depends on the published
   # beagle_turso_core version (see Cargo.toml [patch.crates-io] comments),
@@ -111,7 +116,37 @@ jobs:
       - name: Push beagle-turso (platform gems + source), then the adapter
         run: |
           set -e
-          # beagle-turso platform + source gems first (adapter depends on it)
-          for g in dist/beagle-turso-*.gem; do gem push "$g"; done
+
+          push_idempotent() {
+            # Uses push.err (not publish.err -- that name belongs to the
+            # crate-publish job's own error file) so a re-run of this job
+            # never confuses the two.
+            if gem push "$1" 2>push.err; then
+              echo "pushed $1"
+            elif grep -qiE "already been pushed|Repushing" push.err; then
+              echo "already pushed $1 — skipping"; cat push.err
+            else
+              cat push.err
+              return 1
+            fi
+          }
+
+          # `find`, not a glob: the source-gem job's artifact was uploaded
+          # from two paths (gems/beagle-turso/*.gem and
+          # gems/activerecord-beagle-turso/*.gem), so download-artifact's
+          # --merge-multiple preserves each artifact's internal directory
+          # structure -- these gems land NESTED
+          # (dist/beagle-turso/beagle-turso-*.gem,
+          # dist/activerecord-beagle-turso/activerecord-beagle-turso-*.gem),
+          # not flat. A flat `dist/beagle-turso-*.gem` glob would silently
+          # match nothing here. `-name` matches on the basename only, so
+          # beagle-turso-*.gem still won't match the adapter's files --
+          # beagle-turso keeps pushing first either way.
+          while IFS= read -r -d '' g; do
+            push_idempotent "$g" || exit 1
+          done < <(find dist -name 'beagle-turso-*.gem' -print0)
+
           # then the pure-Ruby adapter
-          for g in dist/activerecord-beagle-turso-*.gem; do gem push "$g"; done
+          while IFS= read -r -d '' g; do
+            push_idempotent "$g" || exit 1
+          done < <(find dist -name 'activerecord-beagle-turso-*.gem' -print0)
