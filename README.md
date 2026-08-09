@@ -132,7 +132,6 @@ publishes all three packages via trusted publishing (OIDC, no stored tokens).
 
 Young (`0.1.x`) — the API may still move before `1.0`. Built on the `turso`
 engine, which is itself pre-1.0. Issues and PRs welcome.
-Beagle Software Limited 
 ## License
 
 [MIT](LICENSE).
