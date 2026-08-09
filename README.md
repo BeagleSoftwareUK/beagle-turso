@@ -88,6 +88,12 @@ on `push`. Drive it from Rails with `Beagle::Turso::SyncManager` and a Solid
 Queue recurring job — see the
 [adapter README](gems/activerecord-beagle-turso#readme).
 
+> The above opens a connection. A real app also needs the `db:` task
+> registration, the sync wiring, in-process Solid Queue, and the deploy
+> constraints that the exclusive lock imposes — all of which fail in
+> non-obvious ways when missed. **[Setting up a new Rails app on
+> beagle_turso](docs/rails-app-setup.md)** is the full checklist.
+
 ## Quick start (plain Ruby)
 
 ```ruby
