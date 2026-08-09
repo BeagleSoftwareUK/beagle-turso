@@ -238,16 +238,65 @@ impl Drop for Database {
     }
 }
 
+/// Does this SQL reference a pragma table-valued function (`pragma_table_list`,
+/// `pragma_table_info`, `pragma_database_list`, ...)?
+///
+/// Deliberately a cheap substring test rather than a parse: a false positive
+/// (a user table or string literal containing `pragma_`) only costs one empty
+/// BEGIN/COMMIT pair, whereas a false negative silently loses writes. See
+/// [`Connection::repair_pragma_tvf_wedge`].
+fn uses_pragma_tvf(sql: &str) -> bool {
+    sql.as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"pragma_"))
+}
+
 impl Connection {
+    /// Works around a turso 0.7.2 bug that silently discards writes.
+    ///
+    /// A pragma table-valued function (`SELECT ... FROM pragma_table_list`, as
+    /// opposed to the `PRAGMA table_list` statement form) is implemented by
+    /// `PragmaVirtualTableCursor`, which prepares an inner helper statement via
+    /// `Connection::prepare_internal`. Helper statements carry a "nested"
+    /// guard, and `Connection::is_nested_stmt()` is what the VDBE consults to
+    /// decide whether a statement owns transaction finalization. That guard is
+    /// never released for the pragma cursor, so the connection stays
+    /// permanently marked as nested and every subsequent statement skips its
+    /// commit: writes report success, are visible to the rest of the session,
+    /// and are gone once it closes. turso_core carries the identical fix for
+    /// two sibling paths (see the `take_parse_schema_if_active` and
+    /// `cleanup_vacuum_state` cleanup in `vdbe/mod.rs`) — the pragma cursor was
+    /// missed.
+    ///
+    /// An explicit `BEGIN`/`COMMIT` pair clears the leaked guard, so run one
+    /// after any statement that used a pragma TVF. Inside a caller's own
+    /// explicit transaction the bug does not bite (the outer `COMMIT` commits
+    /// normally) and `BEGIN` would fail with "cannot start a transaction
+    /// within a transaction" — so a failed `BEGIN` is the signal to do nothing,
+    /// not an error to propagate.
+    ///
+    /// Remove once turso releases the upstream fix.
+    fn repair_pragma_tvf_wedge(&self, conn: &turso::Connection) {
+        self.rt.block_on(async {
+            if conn.execute("BEGIN", ()).await.is_ok() {
+                let _ = conn.execute("COMMIT", ()).await;
+            }
+        });
+    }
+
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
-        self.rt.block_on(async {
+        let result = self.rt.block_on(async {
             conn.execute(sql, tparams)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
-        })
+        });
+        if uses_pragma_tvf(sql) {
+            self.repair_pragma_tvf_wedge(conn);
+        }
+        result
     }
 
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -261,7 +310,7 @@ impl Connection {
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
-        self.rt.block_on(async {
+        let result = self.rt.block_on(async {
             let mut rows = conn
                 .query(sql, tparams)
                 .await
@@ -281,7 +330,11 @@ impl Connection {
                 out.push(Row { values: vals });
             }
             Ok(QueryResult { columns, rows: out })
-        })
+        });
+        if uses_pragma_tvf(sql) {
+            self.repair_pragma_tvf_wedge(conn);
+        }
+        result
     }
 
     /// Returns the rowid of the last row inserted by this connection.
@@ -307,11 +360,15 @@ impl Connection {
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
-        self.rt.block_on(async {
+        let result = self.rt.block_on(async {
             conn.execute_batch(sql)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
-        })
+        });
+        if uses_pragma_tvf(sql) {
+            self.repair_pragma_tvf_wedge(conn);
+        }
+        result
     }
 
     /// Close this connection, releasing the underlying `turso::Connection`

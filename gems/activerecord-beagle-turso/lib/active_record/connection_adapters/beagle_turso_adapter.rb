@@ -126,7 +126,22 @@ module ActiveRecord
         # foreign_key_check) falls through to the real driver result instead
         # of a synthesized one -- failing loudly on a genuine future gap
         # rather than silently lying.
-        BARE_PRAGMA_READ_REGEX = /\A\s*PRAGMA\s+(defer_foreign_keys|read_uncommitted)\s*\z/i
+        #
+        # The SQL-comment allowances on both ends are load-bearing, not
+        # cosmetic: with `config.active_record.query_log_tags_enabled = true`
+        # (the Rails app-generator default for development since 7.0) every
+        # statement arrives tagged -- `PRAGMA defer_foreign_keys
+        # /*application='MyApp'*/`. An `\z`-anchored match misses that, the
+        # synthesized default never fires, and the very crash this constant
+        # exists to prevent comes back: `add_foreign_key` (and every other
+        # alter_table schema change) dies with "query failed: incomplete
+        # input" while loading db/schema.rb. Tags can be prepended as well as
+        # appended (query_log_tags_format / prepend_comment), so allow both.
+        SQL_COMMENTS = %r{(?:\s*/\*.*?\*/)*}m
+        private_constant :SQL_COMMENTS
+
+        BARE_PRAGMA_READ_REGEX =
+          /\A#{SQL_COMMENTS}\s*PRAGMA\s+(defer_foreign_keys|read_uncommitted)\s*#{SQL_COMMENTS}\s*\z/im
         private_constant :BARE_PRAGMA_READ_REGEX
 
         # --- execution surface used by BeagleTursoAdapter#perform_query ---
@@ -191,6 +206,23 @@ module ActiveRecord
       end
 
       private
+        # Every table-listing question Rails asks (`tables`, `views`,
+        # `data_sources`, `table_exists?`, and through them the schema cache and
+        # the schema dumper) is built from this one string in
+        # SQLite3::SchemaStatements.
+        #
+        # beagle_turso's engine keeps a `__turso_internal_seq___turso_internal_
+        # autoincrement_<table>` bookkeeping table for each AUTOINCREMENT table.
+        # They are engine internals of exactly the kind Rails already excludes
+        # by name (`sqlite_sequence`, `sqlite_schema`), but Rails cannot know
+        # about them -- so without this filter `db:schema:dump` emits one
+        # `create_table "__turso_internal_seq_..."` block per table into
+        # db/schema.rb, and the next `db:schema:load` tries to create them for
+        # real.
+        def data_source_sql(name = nil, type: nil)
+          "#{super} AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'"
+        end
+
         # The single seam. AbstractAdapter#raw_execute funnels every statement
         # here and expects an ActiveRecord::Result back, with the notification
         # payload's affected_rows/row_count filled in. cast_result (inherited)

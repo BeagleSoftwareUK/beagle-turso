@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 magnus = "0.8"
-beagle_turso_core = "0.1.0"
+beagle_turso_core = "0.1.3"
