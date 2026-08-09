@@ -223,6 +223,65 @@ module ActiveRecord
           "#{super} AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'"
         end
 
+        # A column definition in the DDL that carries a parenthesised type
+        # argument: `"price" decimal (10, 2) NOT NULL`, `a varchar (50)`. The
+        # name may be bare or quoted with ", ` or []; the type may be several
+        # words ("double precision"); the argument is one or two integers.
+        DECLARED_TYPE_REGEX = /
+          \A\s*
+          (?:"(?<name>[^"]*)" | `(?<name>[^`]*)` | \[(?<name>[^\]]*)\] | (?<name>\w+))
+          \s+
+          (?<type>[A-Za-z_][A-Za-z0-9_\ ]*?)
+          \s*\(\s*(?<args>\d+\s*(?:,\s*\d+)?)\s*\)
+        /x
+        private_constant :DECLARED_TYPE_REGEX
+
+        # Restore type arguments that beagle_turso's `PRAGMA table_info` drops.
+        #
+        # turso reports a column's declared type as the bare type name: a
+        # `decimal(10,2)` column comes back as `decimal`, `varchar(50)` as
+        # `varchar`, `datetime(6)` as `datetime`. Rails derives precision,
+        # scale and limit by parsing exactly that string, so all three silently
+        # become nil. Real SQLite returns the full declared type here, and the
+        # information is not lost on disk -- the CREATE TABLE in sqlite_master
+        # still says `decimal (10, 2)` -- so recover it from there.
+        #
+        # Left alone this is worse than cosmetic schema.rb churn: a dump emits
+        # `t.decimal "price"` with no precision/scale, and loading that dump
+        # builds a column whose values are no longer rounded to 2 decimal
+        # places. `super` already splits the DDL into per-column strings to
+        # recover COLLATE, AUTOINCREMENT and GENERATED ALWAYS AS for the same
+        # reason; this is the same trick for the type itself.
+        #
+        # Only fills in a missing argument -- a type that already arrived with
+        # one is left untouched, so this becomes an automatic no-op if turso
+        # starts reporting declared types in full.
+        def table_structure_with_collation(table_name, basic_structure)
+          columns = super
+          return columns unless columns.any? { |column| !column["type"].to_s.include?("(") }
+
+          declared = declared_column_types(table_name, columns.filter_map { |c| c["name"] })
+          return columns if declared.empty?
+
+          columns.each do |column|
+            next if column["type"].to_s.include?("(")
+
+            full_type = declared[column["name"]]
+            column["type"] = full_type if full_type
+          end
+        end
+
+        # Maps column name -> declared type with its argument normalised back
+        # to Rails' own spelling (`decimal (10, 2)` -> `decimal(10,2)`), which
+        # is what Rails' precision/scale/limit extraction expects to see.
+        def declared_column_types(table_name, column_names)
+          table_structure_sql(table_name, column_names).each_with_object({}) do |column_string, declared|
+            next unless (match = DECLARED_TYPE_REGEX.match(column_string))
+
+            declared[match[:name]] = "#{match[:type]}(#{match[:args].gsub(/\s+/, '')})"
+          end
+        end
+
         # The single seam. AbstractAdapter#raw_execute funnels every statement
         # here and expects an ActiveRecord::Result back, with the notification
         # payload's affected_rows/row_count filled in. cast_result (inherited)
