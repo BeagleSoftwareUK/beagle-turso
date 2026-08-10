@@ -145,7 +145,7 @@ Three things bite hard enough to call out here, each covered in the
 crates/beagle_turso_core/          # the Rust sync core (published to crates.io)
 gems/beagle-turso/                 # the native-extension driver gem
 gems/activerecord-beagle-turso/    # the ActiveRecord adapter gem
-docs/superpowers/                  # design specs, plans, and the release runbook
+docs/                              # the Rails app setup guide
 ```
 
 Releases are cut by tagging `vX.Y.Z`; CI cross-compiles the precompiled gems and
