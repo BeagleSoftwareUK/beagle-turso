@@ -122,6 +122,23 @@ container swaps on a single replica, don't co-host the same DB with the legacy
 libSQL driver. The [`beagle-turso` README](gems/beagle-turso#readme) covers the
 durability model and the "which database?" guidance in full.
 
+Three things bite hard enough to call out here, each covered in the
+[setup guide](docs/rails-app-setup.md):
+
+- **Create databases with `turso db create <name> --tursodb`.** Without the
+  flag you get a database that answers HTTP fine — tokens verify, `turso db
+  list` looks identical — but has no sync route, so the app cannot open it at
+  all. Verify credentials by opening and pushing through the driver; an HTTP
+  check passes on a database the sync engine cannot use.
+- **Every deploy after the first needs `bin/kamal app stop` first**, per
+  destination. Otherwise the new container cannot open a replica the old one
+  still holds, and the deploy fails on `db:prepare`. A `pre-deploy` hook can
+  automate it.
+- **Monitor the sync, not the site.** The app serves from its local replica, so
+  a broken — or wrongly-pointed — sync is invisible from outside: HTTP 200
+  throughout, while the off-box copy stops advancing or lands in the wrong
+  database.
+
 ## Repository layout
 
 ```

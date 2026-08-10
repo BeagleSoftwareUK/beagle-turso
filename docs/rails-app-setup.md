@@ -21,15 +21,48 @@ environments at one database, and do not reuse a database that the legacy
 libSQL driver has written to.
 
 ```sh
-turso db create myapp-prod
-turso db create myapp-staging
+turso db create myapp-prod  --tursodb
+turso db create myapp-stage --tursodb
 
-turso db show myapp-prod --url          # -> libsql://myapp-prod-<org>.turso.io
+turso db show myapp-prod --url          # -> turso://myapp-prod-<org>.turso.io
 turso db tokens create myapp-prod       # -> the auth token
 ```
 
+**`--tursodb` is required, and omitting it fails in a way nothing warns you
+about.** Without it you get a classic database: it serves the Hrana HTTP API
+perfectly, so tokens verify and `turso db list` reports `Type: Turso` exactly
+as it does for a good one. But it has no sync route, so the first thing the app
+does on boot — open the replica — dies with:
+
+```
+sync engine operation failed: remote server returned an error: status=502,
+body={"error":"no route configured for host myapp-prod-<org>.turso.io"}
+```
+
+`db:prepare` aborts, the container never becomes healthy, and Kamal rolls back.
+Nothing distinguishes the two kinds of database except opening one.
+
 Dev and test do **not** get a Turso database. They are local-only files with no
 credentials and no cloud sync, so the app works offline.
+
+### Verify the credentials through the sync engine, not over HTTP
+
+A `curl` against `/v2/pipeline` succeeds on a database the sync engine cannot
+use, so it proves nothing. Check the path the app actually takes:
+
+```ruby
+# bin/rails runner
+c = Rails.application.credentials.turso
+db = Beagle::Turso::Database.open(local_path: "/tmp/verify.db",
+                                  remote_url: c[:prod_url], auth_token: c[:prod_token])
+conn = db.connect
+conn.query_result("SELECT 1", [])
+db.push        # the push is the point -- open alone can pass on a bad database
+conn.close; db.close
+```
+
+Run this after any credential or database change, for every synced
+environment, **before** deploying.
 
 ## 2. Gemfile
 
@@ -216,15 +249,52 @@ jobs needs a different data story for the primary first.
 ### Deploys after the first are brief-downtime
 
 Kamal boots the new container before stopping the old one, and the new one's
-`db:prepare` cannot open a replica the old container still holds. So:
+`db:prepare` cannot open a replica the old container still holds. So **every
+deploy, per destination**:
 
 ```sh
-bin/kamal app stop && bin/kamal deploy
+bin/kamal app stop && bin/kamal deploy                          # production
+bin/kamal app stop -d staging && bin/kamal deploy -d staging    # each destination
 ```
 
-The *first* cutover deploy is fine with a plain `bin/kamal deploy` — the
-outgoing container holds no local-file lock. Every deploy after that needs the
-stop first. This is inherent to one local replica per app, not a config toggle.
+Forget the stop and the deploy fails like this, retrying until the health check
+times out:
+
+```
+Locking error: Failed locking file '/rails/storage/production.sqlite3'.
+File is locked by another process
+```
+
+That failure is safe — the running container is never displaced, so the site
+stays up and you can simply stop and redeploy. It is also relentless: it costs
+a deploy cycle every single time it is forgotten.
+
+Only the **very first** deploy of an environment is fine with a plain
+`bin/kamal deploy` — nothing holds the lock yet. The same applies to a cutover
+deploy where the outgoing container ran a remote-only adapter and therefore
+held no local-file lock. Every deploy after that needs the stop.
+
+This is inherent to one local replica per app, not a config toggle. If you would
+rather not have to remember, a `.kamal/hooks/pre-deploy` script that runs the
+stop makes a plain `bin/kamal deploy` do the right thing every time.
+
+### Repointing an environment at a different database
+
+Changing `remote_url` is not enough. The replica's sidecar files pin sync state
+to the old database's revision, so the new container tries to resume against it.
+Stop the app and delete the replica **and its sidecars** from the volume:
+
+```sh
+bin/kamal app stop
+ssh <host> "docker run --rm -v <app>_storage:/s alpine sh -c \
+  'rm -f /s/<env>.sqlite3 /s/<env>.sqlite3-wal /s/<env>.sqlite3-shm \
+        /s/<env>.sqlite3-info /s/<env>.sqlite3-changes \
+        /s/<env>.sqlite3-wal-revert /s/<env>.db-log'"
+bin/kamal deploy
+```
+
+Leave `<env>_cache.sqlite3`, `<env>_queue.sqlite3` and `<env>_cable.sqlite3`
+alone — those are the Solid stores on plain sqlite3, unrelated to the primary.
 
 ## 9. Verify before you ship
 
@@ -238,6 +308,26 @@ bin/ci
 `db:migrate:status` is the one that catches a broken setup: an app whose
 migration bookkeeping was lost reports "Schema migrations table does not exist
 yet" while every other command exits 0.
+
+## 10. Watch the sync, not just the site
+
+The site being up tells you nothing about whether sync works. The app serves
+entirely from its local replica, so both of these look identical from outside —
+HTTP 200, no errors, no alerts:
+
+- **Sync failing.** The off-box copy silently stops advancing. Solid Queue
+  records the failures; check `solid_queue_failed_executions` for
+  `BeagleTurso::SyncJob`, or watch `last_push_unix_time` in
+  `storage/<env>.sqlite3-info`.
+- **Sync succeeding against the wrong database.** Strictly worse, and nothing
+  anywhere reports a problem. A wrong `remote_url` — a typo, a copy-pasted
+  block from another app — means the replica happily pushes into someone
+  else's database. Observed in practice: one app pushed into another's
+  *production* database for ~19 hours before anyone noticed.
+
+Worth asserting at boot that `remote_url` matches the environment the app
+thinks it is, and alerting on SyncJob failures. Neither is expensive; both
+catch a class of problem that is otherwise invisible until you go looking.
 
 ---
 
