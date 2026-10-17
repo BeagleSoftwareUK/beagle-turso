@@ -67,6 +67,8 @@ An optional `bootstrap_if_empty:` (default `true`) controls whether a brand
 new/empty local file is populated from the remote on first open — see
 `Beagle::Turso::Database.open`.
 
+The sync engine's own tables (`turso_cdc`, `turso_cdc_version`, `turso_sync_last_change_id`) are hidden from `connection.tables`/`data_sources` and therefore from schema dumps and table-truncating tooling.
+
 ### Durability note: writes commit on-sync, not synchronously
 
 Writes go to the **local** file immediately, as part of the normal
