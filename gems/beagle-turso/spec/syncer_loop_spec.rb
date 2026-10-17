@@ -8,6 +8,7 @@ RSpec.describe "Beagle::Turso::Syncer background loop" do
   let(:db) { FakeDatabase.new }
   def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   def wait_for(timeout = 2) = (deadline = now + timeout; sleep 0.005 until yield || now > deadline)
+  def loop_thread(syncer) = syncer.instance_variable_get(:@thread)
 
   it "cycles on the interval once started and stops cleanly" do
     s = Beagle::Turso::Syncer.new(db, interval: 0.02)
@@ -22,11 +23,15 @@ RSpec.describe "Beagle::Turso::Syncer background loop" do
   end
 
   it "start is idempotent and a stopped syncer cannot restart" do
+    before = Thread.list
     s = Beagle::Turso::Syncer.new(db, interval: 1)
     s.start
+    first = loop_thread(s)
     s.start
-    expect(Thread.list.count { _1.name == "beagle-turso-syncer" }).to eq(1)
+    expect(loop_thread(s)).to equal(first)
+    expect((Thread.list - before).count { _1.name == "beagle-turso-syncer" }).to eq(1)
     s.stop(final_push: false)
+    expect(first.alive?).to be(false)
     expect { s.start }.to raise_error(Beagle::Turso::Error, /stopped/)
   end
 
@@ -77,6 +82,7 @@ RSpec.describe "Beagle::Turso::Syncer background loop" do
     expect(now - t).to be_between(0.15, 1.0)
     expect(st.syncing).to be(true)
     gate << :go
+    expect(loop_thread(s).join(2)).not_to be_nil
   end
 
   it "stop is idempotent" do
@@ -106,6 +112,77 @@ RSpec.describe "Beagle::Turso::Syncer background loop" do
     s.start
     st = Timeout.timeout(2) { stopped.pop }
     expect(st.running).to be(false)
+    expect(loop_thread(s).join(2)).not_to be_nil
+  end
+
+  it "stop from inside on_error with final_push: true returns promptly and skips the final push" do
+    s = nil
+    db.on_push = -> { raise Beagle::Turso::SyncError, "x" if db.pushes == 1 }
+    stopped = Queue.new
+    s = Beagle::Turso::Syncer.new(db, interval: 0.01, on_error: lambda { |*|
+      t = now
+      st = s.stop(timeout: 1)
+      stopped << [st, now - t]
+    })
+    s.start
+    st, took = Timeout.timeout(3) { stopped.pop }
+    expect(took).to be < 0.2
+    expect(st.running).to be(false)
+    expect(loop_thread(s).join(2)).not_to be_nil
+    expect(db.pushes).to eq(1)
+  end
+
+  it "stop waits for a sync_now in flight on another thread, then pushes once more" do
+    gate = Queue.new
+    first = true
+    db.on_push = -> { if first then first = false; gate.pop end }
+    s = Beagle::Turso::Syncer.new(db, interval: 60)
+    caller_thread = Thread.new { s.sync_now }
+    wait_for { s.status.syncing }
+    stopper = Thread.new { s.stop(timeout: 2) }
+    sleep 0.1
+    expect(stopper.alive?).to be(true)
+    gate << :go
+    st = stopper.value
+    expect(caller_thread.value).to eq(:ok)
+    expect(db.pushes).to eq(2)
+    expect(st.syncing).to be(false)
+  end
+
+  it "stop survives a loop thread killed by a non-StandardError and still pushes" do
+    db.on_push = -> { raise Beagle::Turso::SyncError, "x" if db.pushes == 1 }
+    log = StringIO.new
+    s = Beagle::Turso::Syncer.new(db, interval: 0.01, logger: Logger.new(log),
+                                  on_error: ->(*) { raise Exception, "callback exploded" })
+    previous = Thread.report_on_exception
+    begin
+      Thread.report_on_exception = false
+      s.start
+    ensure
+      Thread.report_on_exception = previous
+    end
+    wait_for { !loop_thread(s).alive? }
+    expect(s.running?).to be(false)
+    expect(s.status.running).to be(false)
+    st = nil
+    expect { st = s.stop(timeout: 1) }.not_to raise_error
+    expect(st).to be_a(Beagle::Turso::Syncer::Status)
+    expect(db.pushes).to eq(2)
+    expect(st.last_push_at).to be_a(Time)
+    expect(log.string).to include("callback exploded")
+  end
+
+  it "rejects a bad timeout without stopping, so a later stop still pushes" do
+    s = Beagle::Turso::Syncer.new(db, interval: 60).start
+    wait_for { db.pushes == 1 }
+    [nil, -1, "5"].each do |bad|
+      expect { s.stop(timeout: bad) }.to raise_error(ArgumentError, /timeout/)
+    end
+    expect(s.running?).to be(true)
+    st = s.stop
+    expect(st.running).to be(false)
+    expect(db.pushes).to eq(2)
+    expect(loop_thread(s).alive?).to be(false)
   end
 
   it "records failures when the database is closed under it (database closed under it)" do
