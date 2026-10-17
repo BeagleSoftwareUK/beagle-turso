@@ -99,6 +99,8 @@ pub struct Row {
 /// alongside the rows, since [`Row`] alone carries no column metadata.
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// Declared type per column (None for expressions or untyped columns).
+    pub decl_types: Vec<Option<String>>,
     pub rows: Vec<Row>,
 }
 
@@ -312,10 +314,14 @@ impl Connection {
                 .query(sql, tparams)
                 .await
                 .map_err(|e| Error::from_engine(Error::Query, e))?;
-            // turso::Rows::column_names() reads column metadata off the
-            // prepared statement, so it's available up front (no need to
-            // step first) and stays fixed across the whole result set.
-            let columns = rows.column_names();
+            // turso::Rows::columns() reads metadata off the prepared statement,
+            // so it's available before stepping and fixed for the result set.
+            let cols = rows.columns();
+            let columns = cols.iter().map(|c| c.name().to_string()).collect();
+            let decl_types = cols
+                .iter()
+                .map(|c| c.decl_type().map(str::to_string))
+                .collect();
             let mut out = Vec::new();
             while let Some(row) = rows
                 .next()
@@ -332,7 +338,11 @@ impl Connection {
                 }
                 out.push(Row { values: vals });
             }
-            Ok(QueryResult { columns, rows: out })
+            Ok(QueryResult {
+                columns,
+                decl_types,
+                rows: out,
+            })
         });
         result
     }

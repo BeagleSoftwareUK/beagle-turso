@@ -151,6 +151,18 @@ impl RbDatabase {
     }
 }
 
+fn rows_to_ruby(ruby: &Ruby, rows: Vec<beagle_turso_core::Row>) -> Result<RArray, Error> {
+    let out = ruby.ary_new();
+    for row in rows {
+        let rb_row = ruby.ary_new();
+        for val in &row.values {
+            rb_row.push(value_to_ruby(ruby, val))?;
+        }
+        out.push(rb_row)?;
+    }
+    Ok(out)
+}
+
 impl RbConnection {
     fn execute(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<u64, Error> {
         let p = ruby_array_to_params(ruby, params)?;
@@ -166,15 +178,7 @@ impl RbConnection {
             .inner
             .query(&sql, &p)
             .map_err(|e| raise_core(ruby, e))?;
-        let out = ruby.ary_new();
-        for row in rows {
-            let rb_row = ruby.ary_new();
-            for val in &row.values {
-                rb_row.push(value_to_ruby(ruby, val))?;
-            }
-            out.push(rb_row)?;
-        }
-        Ok(out)
+        rows_to_ruby(ruby, rows)
     }
 
     // Like `query`, but also returns column names — needed by callers (e.g.
@@ -196,17 +200,39 @@ impl RbConnection {
         for name in &result.columns {
             columns.push(name.clone().into_value_with(ruby))?;
         }
-        let rows = ruby.ary_new();
-        for row in result.rows {
-            let rb_row = ruby.ary_new();
-            for val in &row.values {
-                rb_row.push(value_to_ruby(ruby, val))?;
-            }
-            rows.push(rb_row)?;
-        }
+        let rows = rows_to_ruby(ruby, result.rows)?;
         let out = ruby.ary_new();
         out.push(columns)?;
         out.push(rows)?;
+        Ok(out)
+    }
+
+    // Like `query_result`, plus each column's declared type (String or nil),
+    // which a Sequel adapter needs to pick value conversions. Returns
+    // `[columns, decl_types, rows]`.
+    fn query_result_with_types(
+        ruby: &Ruby,
+        rb_self: &Self,
+        sql: String,
+        params: RArray,
+    ) -> Result<RArray, Error> {
+        let p = ruby_array_to_params(ruby, params)?;
+        let result = rb_self
+            .inner
+            .query_result(&sql, &p)
+            .map_err(|e| raise_core(ruby, e))?;
+        let columns = ruby.ary_new();
+        for name in result.columns {
+            columns.push(name)?;
+        }
+        let types = ruby.ary_new();
+        for t in result.decl_types {
+            types.push(t)?; // Option<String> -> String or nil
+        }
+        let out = ruby.ary_new();
+        out.push(columns)?;
+        out.push(types)?;
+        out.push(rows_to_ruby(ruby, result.rows)?)?;
         Ok(out)
     }
 
@@ -253,6 +279,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     conn.define_method("execute", method!(RbConnection::execute, 2))?;
     conn.define_method("query", method!(RbConnection::query, 2))?;
     conn.define_method("query_result", method!(RbConnection::query_result, 2))?;
+    conn.define_method(
+        "query_result_with_types",
+        method!(RbConnection::query_result_with_types, 2),
+    )?;
     conn.define_method(
         "last_insert_rowid",
         method!(RbConnection::last_insert_rowid, 0),
