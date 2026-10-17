@@ -24,7 +24,7 @@ RSpec.describe "GVL release during network waits" do
     require "async"
     # blocking_operation_wait is prepended onto each scheduler instance only when
     # a worker pool exists, so test for the pool (io-event >= 1.11), not the method.
-    skip "io-event has no WorkerPool" unless Async::Scheduler::WorkerPool
+    skip "io-event has no WorkerPool" unless defined?(Async::Scheduler::WorkerPool) && Async::Scheduler::WorkerPool
 
     StalledRemote.url do |url|
       ticks = 0
@@ -37,6 +37,22 @@ RSpec.describe "GVL release during network waits" do
       # ~1 s of stall at 10 ms per tick; a held reactor yields ~0.
       expect(ticks).to be >= 40
     end
+  end
+
+  it "raises a Timeout during a local open without leaking the opened database" do
+    # The interrupt is raised by rb_nogvl after the call returned; the database
+    # it opened must be dropped (not leaked by a longjmp over Rust frames).
+    path = StalledRemote.tmp_path
+    th = Thread.new { Thread.current.report_on_exception = false; Beagle::Turso::Database.open_local(path) }
+    th.raise(Timeout::Error) # may land before, during or after the open
+    begin
+      th.join
+    rescue Timeout::Error
+      nil # either outcome is fine; what matters is the reopen below
+    end
+    db = Beagle::Turso::Database.open_local(path)
+    expect(db.connect).to be_a(Beagle::Turso::Connection)
+    db.close
   end
 
   it "delivers a Timeout raised during the wait once the native call returns" do

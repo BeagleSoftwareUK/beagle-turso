@@ -98,7 +98,7 @@ impl RbDatabase {
             auth_token: None,
             bootstrap_if_empty: true,
         };
-        let db = without_gvl(|| Database::open(opts)).map_err(|e| raise_core(ruby, e))?;
+        let db = without_gvl(|| Database::open(opts))?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
@@ -119,24 +119,24 @@ impl RbDatabase {
             auth_token,
             bootstrap_if_empty,
         };
-        let db = without_gvl(|| Database::open(opts)).map_err(|e| raise_core(ruby, e))?;
+        let db = without_gvl(|| Database::open(opts))?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
     fn connect(ruby: &Ruby, rb_self: &Self) -> Result<RbConnection, Error> {
         let inner = &rb_self.inner;
-        let c = without_gvl(|| inner.connect()).map_err(|e| raise_core(ruby, e))?;
+        let c = without_gvl(|| inner.connect())?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbConnection { inner: c })
     }
 
     fn push(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         let inner = &rb_self.inner;
-        without_gvl(|| inner.push()).map_err(|e| raise_core(ruby, e))
+        without_gvl(|| inner.push())?.map_err(|e| raise_core(ruby, e))
     }
 
     fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
         let inner = &rb_self.inner;
-        without_gvl(|| inner.pull()).map_err(|e| raise_core(ruby, e))
+        without_gvl(|| inner.pull())?.map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying engine handle and, for a synced database, end its

@@ -8,6 +8,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-magnus = "0.8"
+magnus = { version = "0.8", features = ["rb-sys"] }
 beagle_turso_core = "0.2.0"
 rb-sys = "0.9"
