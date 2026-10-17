@@ -77,7 +77,7 @@ jobs:
           name: cross-gem-${{ matrix.platform }}
           path: ${{ steps.cross-gem.outputs.gem-path }}
 
-  # --- 3. Source gems (both packages) -- the fallback install path for any
+  # --- 3. Source gems (all three packages) -- the fallback install path for any
   # platform not covered by the cross-compile matrix above.
   source-gem:
     needs: publish-crate
@@ -90,16 +90,19 @@ jobs:
         working-directory: gems/beagle-turso
       - run: gem build activerecord-beagle-turso.gemspec
         working-directory: gems/activerecord-beagle-turso
+      - run: gem build sequel-beagle-turso.gemspec
+        working-directory: gems/sequel-beagle-turso
       - uses: actions/upload-artifact@v7
         with:
           name: source-gems
           path: |
             gems/beagle-turso/*.gem
             gems/activerecord-beagle-turso/*.gem
+            gems/sequel-beagle-turso/*.gem
 
   # --- 4. Publish everything to RubyGems via OIDC trusted publishing.
   # beagle-turso (platform + source gems) must land before
-  # activerecord-beagle-turso, which depends on it ("~> 0.1").
+  # activerecord-beagle-turso and sequel-beagle-turso, which depend on it.
   publish-gems:
     needs: [cross-gems, source-gem]
     runs-on: ubuntu-latest
@@ -113,7 +116,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with: { path: dist, merge-multiple: true }
       - uses: rubygems/configure-rubygems-credentials@v2.1.0
-      - name: Push beagle-turso (platform gems + source), then the adapter
+      - name: Push beagle-turso (platform gems + source), then the adapters
         run: |
           set -e
 
@@ -134,21 +137,29 @@ jobs:
           }
 
           # `find`, not a glob: the source-gem job's artifact was uploaded
-          # from two paths (gems/beagle-turso/*.gem and
-          # gems/activerecord-beagle-turso/*.gem), so download-artifact's
+          # from several paths (gems/beagle-turso/*.gem,
+          # gems/activerecord-beagle-turso/*.gem and
+          # gems/sequel-beagle-turso/*.gem), so download-artifact's
           # --merge-multiple preserves each artifact's internal directory
           # structure -- these gems land NESTED
           # (dist/beagle-turso/beagle-turso-*.gem,
-          # dist/activerecord-beagle-turso/activerecord-beagle-turso-*.gem),
+          # dist/activerecord-beagle-turso/activerecord-beagle-turso-*.gem,
+          # dist/sequel-beagle-turso/sequel-beagle-turso-*.gem),
           # not flat. A flat `dist/beagle-turso-*.gem` glob would silently
           # match nothing here. `-name` matches on the basename only, so
-          # beagle-turso-*.gem still won't match the adapter's files --
+          # beagle-turso-*.gem still won't match the adapters' files --
           # beagle-turso keeps pushing first either way.
           while IFS= read -r -d '' g; do
             push_idempotent "$g" || exit 1
           done < <(find dist -name 'beagle-turso-*.gem' -print0)
 
-          # then the pure-Ruby adapter
+          # then the pure-Ruby ActiveRecord adapter
           while IFS= read -r -d '' g; do
             push_idempotent "$g" || exit 1
           done < <(find dist -name 'activerecord-beagle-turso-*.gem' -print0)
+
+          # then the pure-Ruby Sequel adapter, pushed after beagle-turso,
+          # which it depends on
+          while IFS= read -r -d '' g; do
+            push_idempotent "$g" || exit 1
+          done < <(find dist -name 'sequel-beagle-turso-*.gem' -print0)

@@ -226,6 +226,18 @@ this gem.
    each sync — pick a sync cadence accordingly, or run Solid Queue in a separate
    process.
 
+## Known engine issue: self-referencing foreign keys
+
+For a table whose foreign key points at itself (such as a tree-shaped model
+with `parent_id`), the engine checks the constraint per row instead of per
+statement. A multi-row `delete_all` or `update_all`, or a `DROP TABLE`, that
+would be valid at the end of the statement raises `FOREIGN KEY constraint
+failed`. With `ON DELETE SET NULL` (or `dependent: :nullify`), a multi-row
+`delete_all` can silently leave rows behind. Foreign keys between two tables
+are unaffected, and `ON DELETE CASCADE` works. Workarounds: delete children
+before parents, or use `CASCADE`, and avoid `SET NULL` / `dependent: :nullify`
+on self-referencing foreign keys.
+
 ## License
 
 [MIT](https://opensource.org/licenses/MIT).

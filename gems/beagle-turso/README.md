@@ -218,6 +218,17 @@ db.close
   (each worker gets its own) and call `stop` from `on_worker_shutdown` or
   `at_exit`.
 
+## Known engine issue: self-referencing foreign keys
+
+For a table whose foreign key points at itself (such as `parent_id`), the
+engine checks the constraint per row instead of per statement. A multi-row
+`DELETE`, `UPDATE` or `DROP` that would be valid at the end of the statement
+raises `FOREIGN KEY constraint failed`. With `ON DELETE SET NULL`, a multi-row
+`DELETE` can silently leave rows behind. Foreign keys between two tables are
+unaffected, and `ON DELETE CASCADE` works. Workarounds: delete children before
+parents, or use `CASCADE`, and avoid `SET NULL` on self-referencing foreign
+keys.
+
 ## Credential safety
 
 `auth_token` is never included in `inspect` output or in error messages —
