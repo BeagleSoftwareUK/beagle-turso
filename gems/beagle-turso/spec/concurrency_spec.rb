@@ -52,10 +52,8 @@ RSpec.describe "concurrency contract" do
       puts "C1/C2 push=#{push_time.round(3)}s worst=#{worst.transform_values { _1.round(4) }}"
 
       expect(worst[:closed]).to be < 0.05
-      # C2 finding: on a synced database, Database#connect waits inside the
-      # engine for the whole push (~= push_time), although the GVL is released
-      # so other Ruby threads keep running. The brief's `< 0.05` bound does not
-      # hold, so it is not asserted; the measured figure is in the C1/C2 line.
+      # Synced connect waits inside turso for an in-flight push (engine behaviour, not our locks); the GVL is released while it waits.
+      expect(worst[:connect]).to be < push_time + 0.1
       # C1: record the query figure in Task 8's README text. If it is about
       # push_time, the engine serializes queries behind push: STOP and report.
       expect(worst[:query]).to be < [push_time * 0.5, 0.05].max
