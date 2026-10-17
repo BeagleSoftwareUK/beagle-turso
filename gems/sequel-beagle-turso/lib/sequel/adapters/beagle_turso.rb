@@ -379,6 +379,17 @@ module Sequel
         end)
       end
 
+      # For DEFAULT (expr) SQLite reports dflt_value as expr; the engine keeps
+      # the parentheses. A default that isn't parenthesised is a literal, and
+      # no literal starts with "(", so dropping one outer pair is exact.
+      def _parse_pragma_ds(table_name, opts)
+        super.with_row_proc(lambda do |row|
+          d = row[:dflt_value]
+          row[:dflt_value] = d[1...-1] if d.is_a?(String) && d.start_with?("(") && d.end_with?(")")
+          row
+        end)
+      end
+
       # AUTOINCREMENT tables get engine bookkeeping tables in sqlite_master.
       def tables_and_views(filter, opts)
         super.reject { |name| name.to_s.start_with?("__turso_internal_") }

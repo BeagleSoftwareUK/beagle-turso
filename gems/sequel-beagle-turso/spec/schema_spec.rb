@@ -59,4 +59,22 @@ RSpec.describe "Sequel::BeagleTurso schema handling" do
     expect { db.drop_table(:t) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
     expect(db.table_exists?(:t)).to be(true)
   end
+
+  # Sequel integration: "Database schema parser ... should parse defaults from
+  # the schema properly" and "Database schema modifiers ... should handle
+  # combination of default, unique, and not null". Sequel writes DEFAULT (0);
+  # SQLite reports "0", the engine "(0)".
+  it "parses parenthesised column defaults like SQLite does" do
+    db.create_table(:d) do
+      Integer :n, default: 0
+      String :s, default: "blah"
+      Integer :plain
+    end
+    sch = db.schema(:d).to_h
+    expect(sch[:n].values_at(:default, :ruby_default)).to eq(["0", 0])
+    expect(sch[:s].values_at(:default, :ruby_default)).to eq(["'blah'", "blah"])
+    expect(sch[:plain][:default]).to be_nil
+    db.run("CREATE TABLE r (x integer DEFAULT ((1)))")
+    expect(db.schema(:r).first.last[:default]).to eq("(1)") # SQLite strips one pair only
+  end
 end
