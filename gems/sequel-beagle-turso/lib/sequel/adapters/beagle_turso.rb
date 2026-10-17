@@ -172,6 +172,13 @@ module Sequel
         @conversion_procs["datetime"] = @conversion_procs["timestamp"] = method(:to_application_timestamp)
         set_integer_booleans
         reject_url_credentials
+        # The engine allows one writer and reports contention immediately; we
+        # wait in Ruby (see retry_busy), never with PRAGMA busy_timeout, whose
+        # wait holds the GVL so the lock holder can't commit.
+        @busy_timeout = typecast_value_integer(@opts.fetch(:timeout, 5000)) / 1000.0
+        # Take the write lock at BEGIN, so a transaction that can't get it
+        # waits there instead of failing mid-way.
+        self.transaction_mode = (@opts[:transaction_mode] || :immediate).to_sym
         @turso_database, @owns_turso_database = open_turso_database
         scrub_credentials
         sqlite_version # fail fast, and avoid a surprise first query later
@@ -216,10 +223,38 @@ module Sequel
 
       def _execute(sql, opts)
         synchronize(opts[:server]) do |conn|
-          log_connection_yield(sql, conn) { yield conn }
+          run = -> { log_connection_yield(sql, conn) { yield conn } }
+          # Inside a transaction a BusyError means the transaction is dead;
+          # it must surface (and roll back), not be retried.
+          _trans(conn) ? run.call : retry_busy(&run)
         end
       rescue Beagle::Turso::Error => e
         raise_error(e)
+      end
+
+      def begin_new_transaction(conn, opts)
+        retry_busy { super }
+      end
+
+      # Retries a statement that lost the single-writer race, with capped
+      # exponential backoff, for up to timeout: ms. sleep releases the GVL and
+      # yields to a fiber scheduler, so the writer holding the lock can finish.
+      def retry_busy
+        deadline = nil
+        delay = 0.002
+        begin
+          yield
+        rescue Beagle::Turso::BusyError => e
+          raise if e.message.include?("snapshot is stale")
+
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          deadline ||= now + @busy_timeout
+          raise if now + delay > deadline
+
+          sleep delay
+          delay = [delay * 2, 0.1].min
+          retry
+        end
       end
 
       # Sequel runs BEGIN/COMMIT/SAVEPOINT with conn.public_send(method, sql):

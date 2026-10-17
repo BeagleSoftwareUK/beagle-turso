@@ -6,3 +6,4 @@ gemspec
 gem "beagle-turso", path: "../beagle-turso"
 gem "rspec", "~> 3.13"
 gem "logger"
+gem "async", ">= 2.25", require: false
