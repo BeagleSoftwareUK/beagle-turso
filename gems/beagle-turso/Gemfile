@@ -2,4 +2,5 @@ source "https://rubygems.org"
 gemspec
 gem "rake-compiler"
 gem "rspec"
+gem "logger" # bundled gem since Ruby 4.0; specs use it
 gem "async", ">= 2.25.0", require: false

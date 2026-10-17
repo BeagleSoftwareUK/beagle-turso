@@ -152,6 +152,72 @@ still a `RuntimeError`. A replica file already held by another process raises
   `closed?` is safe (it reports the handle as closed if it can't be inspected),
   so inherited handles need no cleanup in the child.
 
+## Background sync
+
+`Beagle::Turso::Syncer` keeps the remote copy current without a job system:
+
+```ruby
+db = Beagle::Turso::Database.open(local_path: "app.db", remote_url: url, auth_token: token)
+
+syncer = Beagle::Turso::Syncer.new(
+  db,
+  interval: 30,        # seconds between cycles
+  pull: true,          # pull after each push (false = push only)
+  max_backoff: 300,    # retry delay cap, seconds
+  on_error: ->(error, status) { ErrorTracker.notify(error) },
+  logger: Logger.new($stderr),
+).start
+
+syncer.status   # => #<data Status running=true, syncing=false, last_push_at=..., ...>
+syncer.sync_now # one cycle now, on this thread; :ok, or :busy if one is running
+                # (a failure is recorded, passed to on_error, then re-raised)
+
+# on shutdown, before closing the database:
+syncer.stop(timeout: 10)   # waits for an in-flight sync, then pushes once more
+# syncer.stop(timeout: 10, final_push: false)  # waits, but doesn't push again
+db.close
+```
+
+- **Opt-in.** Requiring the gem starts nothing. `start` runs one background
+  thread. `push` and `pull` release the GVL, so that thread doesn't hold up
+  requests on other threads or a Falcon reactor.
+- **Failures don't stop it.** Each failure is logged (at `warn`) and passed to
+  `on_error`. The next attempt waits `interval × 2ⁿ`, capped at
+  `max_backoff`, with ±20% jitter. A success resets the count. A failed push
+  skips that cycle's pull. A logger or `on_error` that raises a
+  `StandardError` is ignored (an `on_error` error is logged).
+- **`sync_now` re-raises.** A failed `sync_now` records the failure in
+  `status`, logs it, calls `on_error`, then raises the error to you. Since
+  `on_error` has already seen it, don't report it again from a `rescue`. If
+  the error message carried a URL or credential, both `on_error` and the
+  caller get a copy of the error (same class and backtrace) with the redacted
+  message.
+- **Status is for monitoring, not lag.** `last_push_at` says when a push last
+  succeeded, not how much is still unpushed. Alert when `consecutive_failures`
+  grows, or when `last_push_at` gets older than you can tolerate. The site keeps
+  serving from the local replica either way. `destination` is the remote host
+  only, and error messages are stripped of URLs and tokens.
+- **Shutdown is best-effort.** `stop(timeout:, final_push: true)` stops the
+  loop, waits for a cycle in flight on any thread (the loop or a concurrent
+  `sync_now`), then pushes once more unless `final_push: false`. It waits up
+  to `timeout` seconds in total. A push or pull already in flight can't be
+  interrupted, so if the deadline passes, `stop` returns with
+  `status.syncing == true` and the work finishes in the background; process
+  exit then waits for that native call to return (until your platform's kill
+  timeout). `stop(timeout: 0)` skips the final push. Called from inside
+  `on_error`, `stop` can't wait for the cycle it is part of, so it returns
+  without a final push. If the network is down, the deadline passes, or the
+  process is killed, writes stay local until the next process pushes them.
+  `stop` never closes the database; do that after it returns.
+- **Don't call `stop` from a signal handler.** Inside `Signal.trap` it raises
+  `ThreadError` (it takes locks). Call it from your server's shutdown hook or
+  `at_exit`.
+- **One syncer per process, created after fork.** A stopped syncer can't be
+  restarted, so create a new one. With Puma in single mode, create it in an
+  initializer or `on_booted`; in cluster mode, create it in `on_worker_boot`
+  (each worker gets its own) and call `stop` from `on_worker_shutdown` or
+  `at_exit`.
+
 ## Credential safety
 
 `auth_token` is never included in `inspect` output or in error messages —
