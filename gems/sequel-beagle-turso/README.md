@@ -98,6 +98,29 @@ The engine allows one writer at a time and reports contention immediately.
   `mode: :deferred` for read-only transactions.
 - Statements run inside a manual `db.run("BEGIN")` aren't seen as a transaction
   by Sequel, so they get the autocommit busy retry. Use `db.transaction`.
+- A `db.run` with several statements (`"INSERT ...; INSERT ..."`) is never
+  retried, since a retry could re-run a statement that already committed. If
+  the write lock is taken it raises `Sequel::DatabaseLockTimeout` at once, and
+  statements before the failing one may already be committed. Run statements
+  one at a time, or in a `db.transaction`. (A `;` inside a string literal also
+  counts as a second statement.)
+
+**Pool size.** The engine allows many connections (32 and more) to one
+replica, but only one writer at a time. `max_connections` defaults to 4. Under
+write-heavy load a smaller pool makes writers queue in Sequel's pool rather
+than busy-retry against each other. An in-memory database defaults to one
+connection.
+
+## Fork (Puma, Unicorn, forking job runners)
+
+A replica belongs to the process that opened it. After `fork`, the child's
+inherited pooled connections raise `Sequel::DatabaseDisconnectError` and are
+dropped, and opening new ones raises `Sequel::DatabaseConnectionError`
+(`Beagle::Turso::ForkedError`). `DB.disconnect` before forking is not enough,
+because the replica itself can't cross the fork. Create the `Sequel::Database`
+in each process after it forks (for Puma, in `on_worker_boot`), and don't open
+it in the parent. A replica file is locked by one process at a time, so give
+each process its own replica file.
 
 ## Falcon and fibers
 

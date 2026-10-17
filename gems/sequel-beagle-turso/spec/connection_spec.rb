@@ -1,3 +1,5 @@
+require "rbconfig"
+
 RSpec.describe "Sequel::BeagleTurso connection" do
   it "connects with the beagle-turso:// URL scheme (absolute path)" do
     path = tmp_db
@@ -98,6 +100,31 @@ RSpec.describe "Sequel::BeagleTurso connection" do
     db = Sequel.connect(adapter: :beagle_turso, database: tmp_db, remote_url: "libsql://x.invalid", auth_token: nil)
     expect(db.opts.key?(:auth_token)).to be(false)
     db.close_replica
+  end
+
+  # Offline: a local-only replica (no remote_url) ignores the token, so this
+  # runs without credentials and checks the scrubbing in CI.
+  [
+    ["a symbol key", { auth_token: "FAKE_TOKEN_123" }],
+    ["a string key", { "auth_token" => "FAKE_TOKEN_123" }]
+  ].each do |label, token_opts|
+    it "scrubs an auth token passed with #{label} from opts, orig_opts and inspect" do
+      db = Sequel.connect("beagle-turso:/", token_opts)
+      expect(db.opts.inspect.include?("FAKE_TOKEN_123")).to be(false)
+      expect(db.inspect.include?("FAKE_TOKEN_123")).to be(false)
+      expect(db.opts[:orig_opts].inspect.include?("FAKE_TOKEN_123")).to be(false)
+      expect(db.get(Sequel.lit("1"))).to eq(1)
+      db.close_replica
+    end
+  end
+
+  it "defines Sequel::BeagleTurso::VERSION after require \"sequel-beagle-turso\"" do
+    # A clean process without Bundler: bundler/setup evaluates the gemspec,
+    # which loads the version file itself.
+    includes = $LOAD_PATH.flat_map { |d| ["-I", d] }
+    code = 'require "sequel-beagle-turso"; print defined?(Sequel::BeagleTurso::VERSION) ? Sequel::BeagleTurso::VERSION : "undefined"'
+    out = Bundler.with_unbundled_env { IO.popen([RbConfig.ruby, *includes, "-e", code], err: [:child, :out], &:read) }
+    expect(out).to eq(File.read(File.expand_path("../lib/sequel/beagle_turso/version.rb", __dir__))[/VERSION = "(.+)"/, 1])
   end
 
   describe "against a real remote" do

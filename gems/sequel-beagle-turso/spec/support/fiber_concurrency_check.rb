@@ -4,10 +4,11 @@ Sequel.extension :fiber_concurrency
 require "sequel/adapters/beagle_turso"
 require "async"
 
-db = Sequel.connect(adapter: :beagle_turso, database: ARGV.fetch(0), max_connections: 4)
+max = Integer(ARGV.fetch(1, "4"))
+db = Sequel.connect(adapter: :beagle_turso, database: ARGV.fetch(0), max_connections: max)
 db.create_table(:f) { Integer :n }
 Sync do |task|
   8.times.map { |k| task.async { 5.times { |i| db.transaction { db[:f].insert(n: k * 10 + i); sleep 0.01 } } } }.each(&:wait)
 end
-puts "rows=#{db[:f].count} busy_retries=#{db.send(:busy_retry_count)}"
+puts "max_connections=#{db.pool.max_size} rows=#{db[:f].count} busy_retries=#{db.send(:busy_retry_count)}"
 db.close_replica

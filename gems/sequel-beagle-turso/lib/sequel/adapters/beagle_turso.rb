@@ -156,8 +156,11 @@ module Sequel
         _execute(sql, opts) { |conn| conn.execute(sql, []) }
       end
 
+      # execute_batch runs every statement in sql. Retrying a batch after a
+      # busy error could re-run a statement that already committed, so only a
+      # single statement gets the busy retry; a batch runs once.
       def execute_ddl(sql, opts = OPTS)
-        _execute(sql, opts) { |conn| conn.execute_batch(sql) }
+        _execute(sql, opts, busy_retry: single_statement?(sql)) { |conn| conn.execute_batch(sql) }
         nil
       end
 
@@ -296,16 +299,22 @@ module Sequel
         @busy_retries.value
       end
 
-      def _execute(sql, opts)
+      def _execute(sql, opts, busy_retry: true)
         synchronize(opts[:server]) do |conn|
           # The retry sits inside the logged block: one log line per statement,
           # at error level only if it finally fails. Inside a transaction a
           # BusyError means the transaction is dead; it must surface (and
           # roll back), not be retried.
-          log_connection_yield(sql, conn) { _trans(conn) ? yield(conn) : retry_busy { yield conn } }
+          log_connection_yield(sql, conn) { !busy_retry || _trans(conn) ? yield(conn) : retry_busy { yield conn } }
         end
       rescue Beagle::Turso::Error => e
         raise_error(e)
+      end
+
+      # Conservative: a ";" inside a string literal also counts as a second
+      # statement, which only costs that statement its busy retry.
+      def single_statement?(sql)
+        !sql.strip.sub(/;\s*\z/, "").include?(";")
       end
 
       # Same as the shared version, but the BEGIN is retried inside its log
@@ -391,13 +400,27 @@ module Sequel
 
       # For DEFAULT (expr) SQLite reports dflt_value as expr; the engine keeps
       # the parentheses. A default that isn't parenthesised is a literal, and
-      # no literal starts with "(", so dropping one outer pair is exact.
+      # no literal starts with "(", so dropping one outer pair is exact. The
+      # engine also writes a negative number as "- 1" (SQLite: "-1"), which
+      # Sequel can't parse into a Ruby default.
       def _parse_pragma_ds(table_name, opts)
         super.with_row_proc(lambda do |row|
           d = row[:dflt_value]
-          row[:dflt_value] = d[1...-1] if d.is_a?(String) && d.start_with?("(") && d.end_with?(")")
+          if d.is_a?(String)
+            d = d[1...-1] if d.start_with?("(") && d.end_with?(")")
+            row[:dflt_value] = d.sub(/\A-\s+(?=\d)/, "-")
+          end
           row
         end)
+      end
+
+      # Sequel's version turns foreign keys off, rebuilds in a transaction and
+      # turns them back on, each through its own pool checkout. PRAGMA
+      # foreign_keys is per connection, so on a warm pool those can land on
+      # different connections: the rebuild runs with foreign keys on, and a
+      # connection is left with them off. Hold one connection throughout.
+      def apply_alter_table(table, ops)
+        synchronize { super }
       end
 
       # Sequel rebuilds a table by renaming it to a backup, creating the new

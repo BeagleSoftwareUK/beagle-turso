@@ -139,19 +139,42 @@ RSpec.describe "Sequel::BeagleTurso single-writer handling" do
     holder.close
   end
 
-  it "runs concurrent fibers with the fiber_concurrency extension (subprocess)" do
-    script = File.expand_path("support/fiber_concurrency_check.rb", __dir__)
-    io = IO.popen([RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), script, tmp_db], err: [:child, :out])
-    out = begin
-      Timeout.timeout(60) { io.read }
-    rescue Timeout::Error
-      Process.kill("KILL", io.pid)
-      raise "fiber subprocess hung (>60s)"
-    ensure
-      io.close
+  # A batch runs every statement, so retrying it after a busy error could
+  # re-run a statement that already committed. Only single statements retry.
+  it "does not retry a multi-statement run; a single statement under the same contention waits" do
+    holder = db.turso_database.connect
+    holder.execute_batch("BEGIN IMMEDIATE")
+    t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    expect { db.run("INSERT INTO t (n) VALUES (1); INSERT INTO t (n) VALUES (2);") }
+      .to raise_error(Sequel::DatabaseLockTimeout)
+    expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - t).to be < 0.1
+    expect(busy_retries).to eq(0)
+
+    releaser = Thread.new { sleep 0.1; holder.execute_batch("COMMIT") }
+    db.run("INSERT INTO t (n) VALUES (3);")
+    releaser.join
+    holder.close
+    expect(busy_retries).to be > 0
+    expect(db[:t].select_map(:n)).to eq([3])
+  end
+
+  [1, 4].each do |max|
+    it "runs concurrent fibers with the fiber_concurrency extension, max_connections: #{max} (subprocess)" do
+      script = File.expand_path("support/fiber_concurrency_check.rb", __dir__)
+      io = IO.popen([RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), script, tmp_db, max.to_s], err: [:child, :out])
+      out = begin
+        Timeout.timeout(60) { io.read }
+      rescue Timeout::Error
+        Process.kill("KILL", io.pid)
+        raise "fiber subprocess hung (>60s)"
+      ensure
+        io.close
+      end
+      expect($?.success?).to be(true), out
+      expect(out).to include("max_connections=#{max} ")
+      expect(out).to include("rows=40")
+      # One connection: fibers queue in the pool, so there may be no contention.
+      expect(out[/busy_retries=(\d+)/, 1].to_i).to be > 0 if max > 1
     end
-    expect($?.success?).to be(true), out
-    expect(out).to include("rows=40")
-    expect(out[/busy_retries=(\d+)/, 1].to_i).to be > 0
   end
 end

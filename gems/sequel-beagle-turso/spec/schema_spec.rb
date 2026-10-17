@@ -78,6 +78,21 @@ RSpec.describe "Sequel::BeagleTurso schema handling" do
     expect(db.schema(:r).first.last[:default]).to eq("(1)") # SQLite strips one pair only
   end
 
+  # The engine stores DEFAULT -1 as "- 1" (and DEFAULT (-2) as "(- 2)"), which
+  # Sequel can't turn into a Ruby value; SQLite reports "-1".
+  it "parses negative numeric defaults" do
+    db.run("CREATE TABLE neg (a integer DEFAULT -1, b real DEFAULT -1.5, c integer DEFAULT (-2), s text DEFAULT '- 1')")
+    sch = db.schema(:neg).to_h
+    expect(sch[:a].values_at(:default, :ruby_default)).to eq(["-1", -1])
+    expect(sch[:b].values_at(:default, :ruby_default)).to eq(["-1.5", -1.5])
+    expect(sch[:c][:ruby_default]).to eq(-2)
+    expect(sch[:s][:ruby_default]).to eq("- 1") # string literals are left alone
+    db.create_table(:neg2) { Integer :n, default: -1; Float :f, default: -1.5 }
+    sch = db.schema(:neg2).to_h
+    expect(sch[:n][:ruby_default]).to eq(-1)
+    expect(sch[:f][:ruby_default]).to eq(-1.5)
+  end
+
   # Sequel integration: "Database foreign key parsing ... should parse foreign
   # key information into an array of hashes". The engine ignores
   # legacy_alter_table, so Sequel's rename-to-backup rebuild pointed other
@@ -96,5 +111,43 @@ RSpec.describe "Sequel::BeagleTurso schema handling" do
     expect(db.schema(:a, reload: true).to_h[:n][:allow_null]).to be(false)
     db[:b].insert(a_id: 1)
     expect { db[:b].insert(a_id: 99) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
+  end
+end
+
+RSpec.describe "Sequel::BeagleTurso alter_table on a warm connection pool" do
+  let(:db) { Sequel.connect(adapter: :beagle_turso, database: tmp_db, max_connections: 4) }
+  after { db.close_replica }
+
+  # Holds all n pooled connections at once (so they are n distinct ones) and
+  # yields each, from its own thread. Returns the block's results.
+  def with_every_connection(n)
+    ready = Queue.new
+    go = Queue.new
+    threads = n.times.map do
+      Thread.new { db.synchronize { |c| ready << true; go.pop; yield c } }
+    end
+    n.times { ready.pop }
+    n.times { go << true }
+    threads.map(&:value)
+  end
+
+  # Sequel's apply_alter_table turns foreign keys off, rebuilds in a
+  # transaction and turns them back on, each through its own checkout. On a
+  # warm FIFO pool those land on different connections: the rebuild ran with
+  # foreign keys on (and failed), and one connection was left with them off.
+  it "rebuilds a referenced table and leaves foreign keys on for every connection" do
+    expect(with_every_connection(4) { |c| c.object_id }.uniq.size).to eq(4)
+    db.create_table(:parent) { primary_key :id; Integer :n }
+    db.create_table(:child) { primary_key :id; foreign_key :parent_id, :parent }
+    db[:parent].insert(id: 1, n: 1)
+    db[:child].insert(parent_id: 1)
+
+    db.alter_table(:parent) { set_column_not_null :n; set_column_default :n, 0 }
+
+    expect(db.schema(:parent, reload: true).to_h[:n][:allow_null]).to be(false)
+    expect(db[:child].select_map(:parent_id)).to eq([1])
+    fks = with_every_connection(4) { |c| db.fetch("PRAGMA foreign_keys").single_value }
+    expect(fks).to eq([1, 1, 1, 1])
+    expect { db[:child].insert(parent_id: 99) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
   end
 end

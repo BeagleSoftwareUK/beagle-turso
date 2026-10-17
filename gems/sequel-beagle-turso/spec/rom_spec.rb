@@ -1,7 +1,16 @@
 require "rom"
 require "rom-sql"
+require "rom-repository"
 
 RSpec.describe "ROM on sequel-beagle-turso" do
+  author_repo = Class.new(ROM::Repository[:authors]) do
+    commands :create, update: :by_pk
+
+    def by_id(id) = authors.by_pk(id).one
+
+    def with_posts(id) = authors.combine(:posts).by_pk(id).one
+  end
+
   it "infers relations, runs a repository's CRUD, an association and a migration" do
     path = tmp_db
     gateway_db = Sequel.connect("beagle-turso://#{path}")
@@ -47,7 +56,19 @@ RSpec.describe "ROM on sequel-beagle-turso" do
     posts.where(author_id: a[:id]).command(:delete).call
     expect(posts.count).to eq(0)
 
-    rom.disconnect
-    gateway_db.close_replica
+    repo = author_repo.new(rom)
+    grace = repo.create(name: "Grace")
+    expect(grace.name).to eq("Grace")
+    expect(repo.by_id(grace.id).name).to eq("Grace")
+    repo.update(grace.id, name: "Grace H.")
+    expect(repo.by_id(grace.id).name).to eq("Grace H.")
+    posts.command(:create).call(author_id: grace.id, title: "COBOL", published: false)
+    aggregate = repo.with_posts(grace.id)
+    expect(aggregate.name).to eq("Grace H.")
+    expect(aggregate.posts.map(&:title)).to eq(["COBOL"])
+    expect(aggregate.posts.first.published).to be(false)
+  ensure
+    rom&.disconnect
+    gateway_db&.close_replica
   end
 end
