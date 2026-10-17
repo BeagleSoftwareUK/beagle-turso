@@ -175,6 +175,7 @@ module Sequel
         # The engine allows one writer and reports contention immediately; we
         # wait in Ruby (see retry_busy), never with PRAGMA busy_timeout, whose
         # wait holds the GVL so the lock holder can't commit.
+        @busy_retries = 0
         @busy_timeout = typecast_value_integer(@opts.fetch(:timeout, 5000)) / 1000.0
         # Take the write lock at BEGIN, so a transaction that can't get it
         # waits there instead of failing mid-way.
@@ -223,17 +224,24 @@ module Sequel
 
       def _execute(sql, opts)
         synchronize(opts[:server]) do |conn|
-          run = -> { log_connection_yield(sql, conn) { yield conn } }
-          # Inside a transaction a BusyError means the transaction is dead;
-          # it must surface (and roll back), not be retried.
-          _trans(conn) ? run.call : retry_busy(&run)
+          # The retry sits inside the logged block: one log line per statement,
+          # at error level only if it finally fails. Inside a transaction a
+          # BusyError means the transaction is dead; it must surface (and
+          # roll back), not be retried.
+          log_connection_yield(sql, conn) { _trans(conn) ? yield(conn) : retry_busy { yield conn } }
         end
       rescue Beagle::Turso::Error => e
         raise_error(e)
       end
 
+      # Same as the shared version, but the BEGIN is retried inside its log
+      # entry (one line, not one per attempt).
       def begin_new_transaction(conn, opts)
-        retry_busy { super }
+        mode = opts[:mode] || @transaction_mode
+        sql = Sequel::SQLite::DatabaseMethods::TRANSACTION_MODE[mode] or
+          raise Error, "transaction :mode must be one of: :deferred, :immediate, :exclusive, nil"
+        log_connection_yield(sql, conn) { retry_busy { conn.execute_batch(sql) } }
+        set_transaction_isolation(conn, opts)
       end
 
       # Retries a statement that lost the single-writer race, with capped
@@ -251,6 +259,7 @@ module Sequel
           deadline ||= now + @busy_timeout
           raise if now + delay > deadline
 
+          @busy_retries += 1 # test-visible via instance_variable_get
           sleep delay
           delay = [delay * 2, 0.1].min
           retry

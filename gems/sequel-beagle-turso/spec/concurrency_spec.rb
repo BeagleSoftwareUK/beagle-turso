@@ -1,4 +1,5 @@
 require "rbconfig"
+require "timeout"
 
 RSpec.describe "Sequel::BeagleTurso single-writer handling" do
   let(:db) { Sequel.connect(adapter: :beagle_turso, database: tmp_db, max_connections: 4) }
@@ -15,9 +16,32 @@ RSpec.describe "Sequel::BeagleTurso single-writer handling" do
     expect(sqls.any? { |s| s.include?("BEGIN IMMEDIATE") }).to be(true)
   end
 
-  it "concurrent autocommit writers all succeed" do
-    4.times.map { |k| Thread.new { 50.times { |i| db[:t].insert(n: k * 100 + i) } } }.each(&:join)
-    expect(db[:t].count).to eq(200)
+  def busy_retries = db.instance_variable_get(:@busy_retries)
+
+  it "concurrent autocommit writers all succeed, retrying while another writer holds the lock" do
+    holder = db.turso_database.connect
+    holder.execute_batch("BEGIN IMMEDIATE")
+    releaser = Thread.new { sleep 0.1; holder.execute_batch("COMMIT") }
+    4.times.map { |k| Thread.new { 5.times { |i| db[:t].insert(n: k * 100 + i) } } }.each(&:join)
+    releaser.join
+    holder.close
+    expect(db[:t].count).to eq(20)
+    expect(busy_retries).to be > 0
+  end
+
+  it "logs a retried statement once" do
+    sqls = []
+    logger = Object.new
+    %i[info debug warn error].each { |l| logger.define_singleton_method(l) { |m| sqls << m } }
+    holder = db.turso_database.connect
+    holder.execute_batch("BEGIN IMMEDIATE")
+    releaser = Thread.new { sleep 0.1; holder.execute_batch("COMMIT") }
+    db.loggers << logger
+    db[:t].insert(n: 1)
+    releaser.join
+    holder.close
+    expect(busy_retries).to be > 0
+    expect(sqls.grep(/INSERT INTO .t./).size).to eq(1)
   end
 
   it "concurrent transactions all succeed (the second waits at BEGIN)" do
@@ -74,10 +98,42 @@ RSpec.describe "Sequel::BeagleTurso single-writer handling" do
     expect(db[:t].select_order_map(:n)).to eq([0, 1])
   end
 
+  it "does not retry a busy write inside a transaction (the transaction is dead)" do
+    holder = db.turso_database.connect
+    elapsed = nil
+    expect do
+      db.transaction(mode: :deferred) do
+        db[:t].all
+        holder.execute_batch("BEGIN IMMEDIATE")
+        Thread.new { sleep 0.05; holder.execute_batch("COMMIT") }
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        begin
+          db[:t].insert(n: 1)
+        ensure
+          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t
+        end
+      end
+    end.to raise_error(Sequel::DatabaseLockTimeout)
+    expect(elapsed).to be < 0.04 # failed at once; a retry would have waited out the 50 ms holder
+    expect(busy_retries).to eq(0)
+    expect(db[:t].count).to eq(0)
+    sleep 0.1 # let the holder's commit land before closing it
+    holder.close
+  end
+
   it "runs concurrent fibers with the fiber_concurrency extension (subprocess)" do
     script = File.expand_path("support/fiber_concurrency_check.rb", __dir__)
-    out = IO.popen([RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), script, tmp_db], err: [:child, :out], &:read)
+    io = IO.popen([RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), script, tmp_db], err: [:child, :out])
+    out = begin
+      Timeout.timeout(60) { io.read }
+    rescue Timeout::Error
+      Process.kill("KILL", io.pid)
+      raise "fiber subprocess hung (>60s)"
+    ensure
+      io.close
+    end
     expect($?.success?).to be(true), out
     expect(out).to include("rows=40")
+    expect(out[/busy_retries=(\d+)/, 1].to_i).to be > 0
   end
 end
