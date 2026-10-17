@@ -72,9 +72,87 @@ module Beagle
         end
       end
 
-      # --- background loop (Task 4) ---
+      # Starts the background thread. Idempotent while running. A stopped
+      # syncer cannot be restarted; create a new one.
+      def start
+        @state_lock.synchronize do
+          raise Error, "syncer has been stopped; create a new one" if @stopped
+          return self if @thread
+
+          @thread = Thread.new { run_loop }
+          @thread.name = "beagle-turso-syncer"
+        end
+        self
+      end
+
+      def running?
+        @state_lock.synchronize { !@thread.nil? && !@stopping }
+      end
+
+      # Stops the loop and, if final_push and the deadline allows, pushes once
+      # more. Waits at most `timeout` seconds in total: an in-flight push or
+      # pull cannot be interrupted, so if the deadline passes first this
+      # returns anyway with status.syncing true and the work finishes in the
+      # background. Never closes the database. Idempotent.
+      def stop(timeout: 10, final_push: true)
+        first = @state_lock.synchronize do
+          next false if @stopped
+
+          @stopped = true
+          @stopping = true
+          @wake.broadcast
+          true
+        end
+        return status unless first
+
+        deadline = monotonic_now + timeout
+        # Joining our own thread (stop called from on_error) would raise; that
+        # thread exits by itself once the callback returns.
+        @thread.join(remaining(deadline)) if @thread && @thread != Thread.current
+        if final_push && !loop_alive? && remaining(deadline).positive?
+          pusher = Thread.new do
+            cycle(pull: false)
+          rescue StandardError
+            nil # already recorded, logged and reported by cycle
+          end
+          pusher.join(remaining(deadline))
+        end
+        status
+      end
 
       private
+
+      def run_loop
+        loop do
+          return if @state_lock.synchronize { @stopping }
+
+          delay =
+            begin
+              cycle(pull: @pull)
+              @interval
+            rescue StandardError
+              retry_delay(@state_lock.synchronize { @consecutive_failures })
+            end
+
+          @state_lock.synchronize do
+            return if @stopping
+
+            @wake.wait(@state_lock, delay)
+          end
+        end
+      end
+
+      def loop_alive?
+        @thread&.alive? && @thread != Thread.current
+      end
+
+      def remaining(deadline)
+        [deadline - monotonic_now, 0].max
+      end
+
+      def monotonic_now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
 
       def cycle(pull:)
         return :busy unless @cycle_lock.try_lock
