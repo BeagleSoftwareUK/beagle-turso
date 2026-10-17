@@ -178,12 +178,53 @@ module Sequel
         end
       end
 
+      # The engine checks a table's self-references row by row when dropping
+      # it, so a self-referencing table with rows can't be dropped while
+      # foreign keys are on (SQLite drops it). When nothing else could be
+      # referencing the rows, drop it with foreign keys briefly off.
+      def drop_table(*names)
+        opts = names.last.is_a?(Hash) ? names.pop : OPTS
+        names.each do |name|
+          super(name, opts)
+        rescue ForeignKeyConstraintViolation
+          raise unless drop_self_referencing_table(name, opts)
+        end
+        nil
+      end
+
       def freeze
         @conversion_procs.freeze
         super
       end
 
       private
+
+      # True if it dropped the table. PRAGMA foreign_keys is per connection and
+      # ignored inside a transaction, so this needs to own the connection.
+      def drop_self_referencing_table(name, opts)
+        synchronize(opts[:server]) do |conn|
+          return false if _trans(conn) || !self_referencing_only?(name)
+
+          execute_ddl("PRAGMA foreign_keys = 0", opts)
+          begin
+            execute_ddl(drop_table_sql(name, opts), opts)
+          ensure
+            execute_ddl("PRAGMA foreign_keys = 1", opts)
+          end
+          remove_cached_schema(name)
+          true
+        end
+      end
+
+      # The table references itself, and no other table with rows references it.
+      def self_referencing_only?(name)
+        table = name.to_s
+        return false unless foreign_key_list(name).any? { |fk| fk[:table].to_s == table }
+
+        tables.reject { |t| t.to_s == table }.none? do |other|
+          foreign_key_list(other).any? { |fk| fk[:table].to_s == table } && !from(other).empty?
+        end
+      end
 
       def adapter_initialize
         @conversion_procs = SQLITE_TYPES.dup
