@@ -16,7 +16,7 @@ RSpec.describe "Sequel::BeagleTurso single-writer handling" do
     expect(sqls.any? { |s| s.include?("BEGIN IMMEDIATE") }).to be(true)
   end
 
-  def busy_retries = db.instance_variable_get(:@busy_retries)
+  def busy_retries = db.send(:busy_retry_count)
 
   it "concurrent autocommit writers all succeed, retrying while another writer holds the lock" do
     holder = db.turso_database.connect
@@ -27,6 +27,24 @@ RSpec.describe "Sequel::BeagleTurso single-writer handling" do
     holder.close
     expect(db[:t].count).to eq(20)
     expect(busy_retries).to be > 0
+  end
+
+  it "waits out the lock on a frozen Database (autocommit and transaction)" do
+    db.freeze
+    holder = db.turso_database.connect
+    holder.execute_batch("BEGIN IMMEDIATE")
+    releaser = Thread.new { sleep 0.1; holder.execute_batch("COMMIT") }
+    db[:t].insert(n: 1)
+    releaser.join
+    expect(busy_retries).to be > 0
+    before = busy_retries
+    holder.execute_batch("BEGIN IMMEDIATE")
+    releaser = Thread.new { sleep 0.1; holder.execute_batch("COMMIT") }
+    db.transaction { db[:t].insert(n: 2) }
+    releaser.join
+    holder.close
+    expect(busy_retries).to be > before
+    expect(db[:t].select_order_map(:n)).to eq([1, 2])
   end
 
   it "logs a retried statement once" do

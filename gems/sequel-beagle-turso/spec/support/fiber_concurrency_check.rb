@@ -9,5 +9,5 @@ db.create_table(:f) { Integer :n }
 Sync do |task|
   8.times.map { |k| task.async { 5.times { |i| db.transaction { db[:f].insert(n: k * 10 + i); sleep 0.01 } } } }.each(&:wait)
 end
-puts "rows=#{db[:f].count} busy_retries=#{db.instance_variable_get(:@busy_retries)}"
+puts "rows=#{db[:f].count} busy_retries=#{db.send(:busy_retry_count)}"
 db.close_replica

@@ -75,6 +75,24 @@ module Sequel
     }.each { |names, conv| names.each { |n| SQLITE_TYPES[n] = conv } }
     SQLITE_TYPES.freeze
 
+    # Thread-safe retry count. Lives in an ivar of the Database, and a frozen
+    # Database must still be able to count, so it can't be a plain Integer.
+    class BusyCounter
+      def initialize
+        @mutex = Mutex.new
+        @value = 0
+      end
+
+      def increment
+        @mutex.synchronize { @value += 1 }
+      end
+
+      def value
+        @mutex.synchronize { @value }
+      end
+    end
+    private_constant :BusyCounter
+
     class Database < Sequel::Database
       include Sequel::SQLite::DatabaseMethods
 
@@ -175,7 +193,7 @@ module Sequel
         # The engine allows one writer and reports contention immediately; we
         # wait in Ruby (see retry_busy), never with PRAGMA busy_timeout, whose
         # wait holds the GVL so the lock holder can't commit.
-        @busy_retries = 0
+        @busy_retries = BusyCounter.new
         @busy_timeout = typecast_value_integer(@opts.fetch(:timeout, 5000)) / 1000.0
         # Take the write lock at BEGIN, so a transaction that can't get it
         # waits there instead of failing mid-way.
@@ -222,6 +240,11 @@ module Sequel
         end
       end
 
+      # Busy retries so far (for specs).
+      def busy_retry_count
+        @busy_retries.value
+      end
+
       def _execute(sql, opts)
         synchronize(opts[:server]) do |conn|
           # The retry sits inside the logged block: one log line per statement,
@@ -259,7 +282,7 @@ module Sequel
           deadline ||= now + @busy_timeout
           raise if now + delay > deadline
 
-          @busy_retries += 1 # test-visible via instance_variable_get
+          @busy_retries.increment
           sleep delay
           delay = [delay * 2, 0.1].min
           retry
