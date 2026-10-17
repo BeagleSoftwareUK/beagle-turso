@@ -1,0 +1,8 @@
+source "https://rubygems.org"
+gemspec
+
+# The driver is an in-repo path gem during development (installing it builds
+# the native extension).
+gem "beagle-turso", path: "../beagle-turso"
+gem "rspec", "~> 3.13"
+gem "logger"
