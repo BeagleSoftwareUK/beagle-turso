@@ -79,6 +79,21 @@ RSpec.describe "Sequel::BeagleTurso connection" do
       .to raise_error(Sequel::Error) { |e| expect(e.message.include?("SECRETQ")).to be(false) }
   end
 
+  it "rejects an auth_token in the URL even when a replica is injected" do
+    turso = Beagle::Turso::Database.open_local(tmp_db)
+    expect { Sequel.connect("beagle-turso:/?auth_token=TOKX", turso_database: turso) }
+      .to raise_error(Sequel::Error) { |e| expect(e.message.include?("TOKX")).to be(false) }
+    expect(turso.closed?).to be(false)
+    turso.close
+  end
+
+  ["Auth_Token", "AUTH_TOKEN", "auth%5Ftoken", "x=1&auth%5FToken"].each do |name|
+    it "rejects the auth_token parameter spelled #{name}" do
+      expect { Sequel.connect("beagle-turso://#{tmp_db}?#{name}=TOKY") }
+        .to raise_error(Sequel::Error) { |e| expect(e.message.include?("TOKY")).to be(false) }
+    end
+  end
+
   it "does not keep the auth token in opts or inspect" do
     db = Sequel.connect(adapter: :beagle_turso, database: tmp_db, remote_url: "libsql://x.invalid", auth_token: nil)
     expect(db.opts.key?(:auth_token)).to be(false)

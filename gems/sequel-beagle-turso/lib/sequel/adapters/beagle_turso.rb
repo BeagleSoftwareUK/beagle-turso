@@ -86,17 +86,27 @@ module Sequel
 
       def adapter_initialize
         @conversion_procs = SQLITE_TYPES.dup
+        reject_url_credentials
         @turso_database, @owns_turso_database = open_turso_database
         scrub_credentials
         sqlite_version # fail fast, and avoid a surprise first query later
       end
 
+      # Runs before a replica is opened or adopted, so it covers both paths.
+      def reject_url_credentials
+        return unless url_has_auth_token?(@opts[:uri].to_s)
+        raise Error, "pass auth_token: as a connection option, not in the URL (URLs end up in logs)"
+      end
+
+      def url_has_auth_token?(url)
+        query = URI.parse(url).query
+        query && URI.decode_www_form(query).any? { |k, _| k.downcase == "auth_token" }
+      rescue ArgumentError, URI::Error
+        url.match?(/[?&]auth(_|%5f)token(=|&|\z)/i)
+      end
+
       def open_turso_database
         return [@opts[:turso_database], false] if @opts[:turso_database]
-        if @opts[:uri].to_s.match?(/[?&]auth_token=/)
-          raise Error, "pass auth_token: as a connection option, not in the URL (URLs end up in logs)"
-        end
-
         path = @opts[:database].to_s
         path = ":memory:" if path.empty?
         db = Beagle::Turso::Database.open(
