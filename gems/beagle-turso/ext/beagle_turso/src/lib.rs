@@ -14,10 +14,17 @@
 // identical; the code is simpler and compiles with zero deprecation
 // warnings.
 
+// GVL: open_local, open, connect, push and pull (the calls that can wait on the
+// network or disk for a long time) run via nogvl::without_gvl with the GVL
+// released. Queries/execute stay under the GVL: they are short, local, and
+// release/reacquire would cost more than it saves.
+
 mod errors;
+mod nogvl;
 
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
 use errors::raise_core;
+use nogvl::without_gvl;
 use magnus::{
     encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
@@ -91,7 +98,7 @@ impl RbDatabase {
             auth_token: None,
             bootstrap_if_empty: true,
         };
-        let db = Database::open(opts).map_err(|e| raise_core(ruby, e))?;
+        let db = without_gvl(|| Database::open(opts)).map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
@@ -112,30 +119,24 @@ impl RbDatabase {
             auth_token,
             bootstrap_if_empty,
         };
-        let db = Database::open(opts).map_err(|e| raise_core(ruby, e))?;
+        let db = without_gvl(|| Database::open(opts)).map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
     fn connect(ruby: &Ruby, rb_self: &Self) -> Result<RbConnection, Error> {
-        let c = rb_self
-            .inner
-            .connect()
-            .map_err(|e| raise_core(ruby, e))?;
+        let inner = &rb_self.inner;
+        let c = without_gvl(|| inner.connect()).map_err(|e| raise_core(ruby, e))?;
         Ok(RbConnection { inner: c })
     }
 
     fn push(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        rb_self
-            .inner
-            .push()
-            .map_err(|e| raise_core(ruby, e))
+        let inner = &rb_self.inner;
+        without_gvl(|| inner.push()).map_err(|e| raise_core(ruby, e))
     }
 
     fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        rb_self
-            .inner
-            .pull()
-            .map_err(|e| raise_core(ruby, e))
+        let inner = &rb_self.inner;
+        without_gvl(|| inner.pull()).map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying engine handle and, for a synced database, end its
