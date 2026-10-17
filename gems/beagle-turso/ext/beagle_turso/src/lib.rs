@@ -14,7 +14,10 @@
 // identical; the code is simpler and compiles with zero deprecation
 // warnings.
 
+mod errors;
+
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
+use errors::raise_core;
 use magnus::{
     encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
@@ -28,10 +31,6 @@ struct RbDatabase {
 #[magnus::wrap(class = "Beagle::Turso::Connection", free_immediately)]
 struct RbConnection {
     inner: Connection,
-}
-
-fn rt_err(ruby: &Ruby, msg: String) -> Error {
-    Error::new(ruby.exception_runtime_error(), msg)
 }
 
 fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
@@ -92,7 +91,7 @@ impl RbDatabase {
             auth_token: None,
             bootstrap_if_empty: true,
         };
-        let db = Database::open(opts).map_err(|e| rt_err(ruby, e.to_string()))?;
+        let db = Database::open(opts).map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
@@ -113,7 +112,7 @@ impl RbDatabase {
             auth_token,
             bootstrap_if_empty,
         };
-        let db = Database::open(opts).map_err(|e| rt_err(ruby, e.to_string()))?;
+        let db = Database::open(opts).map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
@@ -121,7 +120,7 @@ impl RbDatabase {
         let c = rb_self
             .inner
             .connect()
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
+            .map_err(|e| raise_core(ruby, e))?;
         Ok(RbConnection { inner: c })
     }
 
@@ -129,14 +128,14 @@ impl RbDatabase {
         rb_self
             .inner
             .push()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
         rb_self
             .inner
             .pull()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying engine handle and, for a synced database, end its
@@ -157,7 +156,7 @@ impl RbConnection {
         rb_self
             .inner
             .execute(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn query(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<RArray, Error> {
@@ -165,7 +164,7 @@ impl RbConnection {
         let rows = rb_self
             .inner
             .query(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
+            .map_err(|e| raise_core(ruby, e))?;
         let out = ruby.ary_new();
         for row in rows {
             let rb_row = ruby.ary_new();
@@ -191,7 +190,7 @@ impl RbConnection {
         let result = rb_self
             .inner
             .query_result(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
+            .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in &result.columns {
             columns.push(name.clone().into_value_with(ruby))?;
@@ -214,14 +213,14 @@ impl RbConnection {
         rb_self
             .inner
             .last_insert_rowid()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn execute_batch(ruby: &Ruby, rb_self: &Self, sql: String) -> Result<(), Error> {
         rb_self
             .inner
             .execute_batch(&sql)
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying connection handle instead of waiting for GC.

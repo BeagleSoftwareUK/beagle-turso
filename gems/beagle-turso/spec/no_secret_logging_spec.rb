@@ -8,6 +8,7 @@ RSpec.describe "no credential leakage" do
 
     err = (Beagle::Turso::Database.open(local_path: "/x.db", remote_url: "not-a-scheme://x", auth_token: token) rescue $!)
     expect(err).to be_a(StandardError)
+    expect(err).to be_a(Beagle::Turso::OpenError)
     expect(err.message).not_to include(token)
     expect(err.inspect).not_to include(token)
   end
