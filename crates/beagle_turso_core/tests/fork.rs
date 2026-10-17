@@ -24,7 +24,8 @@ fn child_gets_forked_error_and_drops_inherited_handles_without_hanging() {
     }
 
     let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(waited, pid, "waitpid returned the wrong pid");
     assert!(
         libc::WIFEXITED(status),
         "child did not exit normally (hung or crashed): {status}"
@@ -37,4 +38,5 @@ fn child_gets_forked_error_and_drops_inherited_handles_without_hanging() {
 
     // Parent unaffected.
     assert!(conn.query("SELECT 1", &[]).is_ok());
+    assert!(db.connect().is_ok());
 }

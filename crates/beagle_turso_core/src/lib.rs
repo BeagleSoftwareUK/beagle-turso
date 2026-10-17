@@ -251,7 +251,15 @@ impl Database {
         if check_pid(self.pid).is_err() {
             // Forked child: dropping the engine could block on the parent's
             // worker thread. Leak it; the child's exit reclaims the memory.
-            std::mem::forget(self.inner.lock().unwrap_or_else(|p| p.into_inner()).take());
+            // `try_lock`, because a parent thread may have held the mutex at
+            // fork time, leaving it locked with no owner in the child.
+            match self.inner.try_lock() {
+                Ok(mut g) => std::mem::forget(g.take()),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    std::mem::forget(p.into_inner().take())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
             return;
         }
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -262,6 +270,16 @@ impl Database {
 
     /// Whether this database has been closed (see [`Database::close`]).
     pub fn is_closed(&self) -> bool {
+        if check_pid(self.pid).is_err() {
+            // Forked child: an inherited handle is unusable, so "closed" is the
+            // honest answer, and the mutex may be held by a thread that no
+            // longer exists here.
+            return match self.inner.try_lock() {
+                Ok(g) => g.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            };
+        }
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -275,11 +293,16 @@ impl Drop for Database {
     /// child, `close` leaks the engine and the runtime is not dropped either
     /// (its worker thread only exists in the parent).
     fn drop(&mut self) {
-        self.close();
-        if check_pid(self.pid).is_ok() {
-            // SAFETY: `rt` is never used again after this point.
-            unsafe { ManuallyDrop::drop(&mut self.rt) };
+        if check_pid(self.pid).is_err() {
+            // `get_mut` never touches the futex (`&mut self` proves exclusive
+            // access), so a lock held by a vanished parent thread can't hang us.
+            let slot = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
+            std::mem::forget(slot.take());
+            return;
         }
+        self.close();
+        // SAFETY: `rt` is never used again after this point.
+        unsafe { ManuallyDrop::drop(&mut self.rt) };
     }
 }
 
@@ -391,7 +414,15 @@ impl Connection {
         if check_pid(self.pid).is_err() {
             // Forked child: dropping the engine could block on the parent's
             // worker thread. Leak it; the child's exit reclaims the memory.
-            std::mem::forget(self.conn.lock().unwrap_or_else(|p| p.into_inner()).take());
+            // `try_lock`, because a parent thread may have held the mutex at
+            // fork time, leaving it locked with no owner in the child.
+            match self.conn.try_lock() {
+                Ok(mut g) => std::mem::forget(g.take()),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    std::mem::forget(p.into_inner().take())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
             return;
         }
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -402,6 +433,14 @@ impl Connection {
 
     /// Whether this connection has been closed (see [`Connection::close`]).
     pub fn is_closed(&self) -> bool {
+        if check_pid(self.pid).is_err() {
+            // Forked child: see `Database::is_closed`.
+            return match self.conn.try_lock() {
+                Ok(g) => g.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            };
+        }
         self.conn
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -412,10 +451,110 @@ impl Connection {
 impl Drop for Connection {
     /// Mirrors [`Database`]'s `Drop`, including the forked-child leak.
     fn drop(&mut self) {
-        self.close();
-        if check_pid(self.pid).is_ok() {
-            // SAFETY: `rt` is never used again after this point.
-            unsafe { ManuallyDrop::drop(&mut self.rt) };
+        if check_pid(self.pid).is_err() {
+            let slot = self.conn.get_mut().unwrap_or_else(|p| p.into_inner());
+            std::mem::forget(slot.take());
+            return;
         }
+        self.close();
+        // SAFETY: `rt` is never used again after this point.
+        unsafe { ManuallyDrop::drop(&mut self.rt) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fork_lock_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Fork while another thread holds `lock_it`'s mutex, then run `child_body`
+    /// in the child under a 5s alarm. Before the fix the child's `lock()` waited
+    /// forever on a futex with no owner, and SIGALRM killed it.
+    fn fork_with_lock_held(
+        lock_it: impl FnOnce(mpsc::Sender<()>, mpsc::Receiver<()>) + Send + 'static,
+        child_body: impl FnOnce(),
+    ) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || lock_it(held_tx, release_rx));
+        held_rx.recv().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::alarm(5) };
+            child_body();
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(waited, pid, "waitpid returned the wrong pid");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally (hung on a held lock?): {status}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn forked_child_does_not_hang_on_database_lock_held_at_fork() {
+        let db = Box::new(Database::open(OpenOptions::default()).unwrap());
+        let addr = &*db as *const Database as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `db`.
+                let db = unsafe { &*(addr as *const Database) };
+                let _guard = db.inner.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || {
+                db.close();
+                // Inherited handle is unusable in a child: reported closed.
+                assert!(db.is_closed());
+                std::mem::drop(db);
+            },
+        );
+    }
+
+    #[test]
+    fn forked_child_does_not_hang_on_connection_lock_held_at_fork() {
+        let db = Database::open(OpenOptions::default()).unwrap();
+        let conn = Box::new(db.connect().unwrap());
+        let addr = &*conn as *const Connection as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `conn`.
+                let conn = unsafe { &*(addr as *const Connection) };
+                let _guard = conn.conn.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || {
+                conn.close();
+                assert!(conn.is_closed());
+                std::mem::drop(conn);
+                std::mem::drop(db);
+            },
+        );
+    }
+
+    #[test]
+    fn forked_child_drop_without_close_does_not_hang_on_held_lock() {
+        let db = Box::new(Database::open(OpenOptions::default()).unwrap());
+        let addr = &*db as *const Database as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `db`.
+                let db = unsafe { &*(addr as *const Database) };
+                let _guard = db.inner.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || std::mem::drop(db),
+        );
     }
 }

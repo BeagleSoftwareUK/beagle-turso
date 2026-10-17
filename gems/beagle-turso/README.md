@@ -148,8 +148,9 @@ still a `RuntimeError`. A replica file already held by another process raises
   process.
 - **Fork:** handles are bound to the process that opened them. In a forked
   child, `open`, `connect`, `push`, `pull` and queries on an inherited handle
-  raise `ForkedError`; open a new database there. `close` and `closed?` are
-  safe no-ops, so inherited handles need no cleanup in the child.
+  raise `ForkedError`; open a new database there. `close` is a no-op and
+  `closed?` is safe (it reports the handle as closed if it can't be inspected),
+  so inherited handles need no cleanup in the child.
 
 ## Credential safety
 

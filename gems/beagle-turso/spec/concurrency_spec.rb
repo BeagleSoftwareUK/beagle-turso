@@ -63,11 +63,21 @@ RSpec.describe "concurrency contract" do
     it "lets close race an in-flight push without crashing" do
       db = Beagle::Turso::Database.open(local_path: tmp, remote_url: url, auth_token: token)
       db.connect.execute("CREATE TABLE IF NOT EXISTS cc (payload TEXT)", [])
-      pusher = Thread.new { db.push; :pushed rescue $! }
+      pusher = Thread.new do
+        Thread.current.report_on_exception = false
+        begin
+          db.push
+          :pushed
+        rescue Beagle::Turso::Error => e
+          e
+        end
+      end
       sleep 0.01
       db.close
       result = pusher.value
-      expect(result == :pushed || result.is_a?(Beagle::Turso::Error)).to be(true)
+      expect(result == :pushed || result.is_a?(Beagle::Turso::Error)).to(
+        be(true), "unexpected push outcome of class #{result.class}"
+      )
       expect { db.push }.to raise_error(Beagle::Turso::ClosedError)
     end
   end

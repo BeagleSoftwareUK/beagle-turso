@@ -20,7 +20,6 @@ RSpec.describe "GVL release during network waits" do
   end
 
   it "keeps an Async reactor responsive during a synced open (fiber scheduler offload)" do
-    ENV["ASYNC_SCHEDULER_WORKER_POOL"] ||= "true" # switch per Task 1 F3
     require "async"
     # blocking_operation_wait is prepended onto each scheduler instance only when
     # a worker pool exists, so test for the pool (io-event >= 1.11), not the method.
@@ -28,12 +27,18 @@ RSpec.describe "GVL release during network waits" do
 
     StalledRemote.url do |url|
       ticks = 0
-      Sync do |task|
-        expect(Fiber.scheduler).to respond_to(:blocking_operation_wait)
-        ticker = task.async { loop { ticks += 1; sleep 0.01 } }
-        StalledRemote.open_against(url)
-        ticker.stop
-      end
+      # Build the scheduler with an explicit worker pool in a fresh thread, so
+      # the result doesn't depend on ASYNC_SCHEDULER_WORKER_POOL or load order.
+      Thread.new do
+        scheduler = Async::Scheduler.new(worker_pool: true)
+        Fiber.set_scheduler(scheduler)
+        scheduler.run do
+          expect(Fiber.scheduler).to respond_to(:blocking_operation_wait)
+          ticker = Async { loop { ticks += 1; sleep 0.01 } }
+          StalledRemote.open_against(url)
+          ticker.stop
+        end
+      end.join
       # ~1 s of stall at 10 ms per tick; a held reactor yields ~0.
       expect(ticks).to be >= 40
     end
@@ -43,7 +48,14 @@ RSpec.describe "GVL release during network waits" do
     # The interrupt is raised by rb_nogvl after the call returned; the database
     # it opened must be dropped (not leaked by a longjmp over Rust frames).
     path = StalledRemote.tmp_path
-    th = Thread.new { Thread.current.report_on_exception = false; Beagle::Turso::Database.open_local(path) }
+    # Create the thread with interrupts deferred so the raise below can't land
+    # before report_on_exception is off.
+    th = Thread.handle_interrupt(Object => :never) do
+      Thread.new do
+        Thread.current.report_on_exception = false
+        Thread.handle_interrupt(Object => :immediate) { Beagle::Turso::Database.open_local(path) }
+      end
+    end
     th.raise(Timeout::Error) # may land before, during or after the open
     begin
       th.join
