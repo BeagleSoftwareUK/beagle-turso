@@ -3,11 +3,14 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby: ["3.3", "4.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: ${{ matrix.ruby }}
           rustup-toolchain: stable
           bundler-cache: true
           cargo-cache: true

@@ -46,22 +46,13 @@ module Beagle
     module SyncManager
       # Raised by +push!+/+pull!+/+sync!+ when the given connection is
       # local-only (its database.yml entry has no +remote_url+/+auth_token+,
-      # so BeagleTursoAdapter opened it via +Database.open_local+). The
-      # underlying Client#push/#pull already raise a bare RuntimeError for
-      # this (see Beagle::Turso::Database#push/#pull); SyncManager re-raises
-      # it as this distinct, documented type so callers can rescue it
-      # specifically instead of matching on the driver's message text. A
+      # so BeagleTursoAdapter opened it via +Database.open_local+). The driver
+      # raises Beagle::Turso::NotSyncedError for this; SyncManager re-raises it
+      # as this type (kept for compatibility) with a database.yml hint. A
       # genuine sync failure against a real remote (network error, auth
-      # failure, etc.) is NOT reclassified -- it propagates as whatever error
-      # the driver raised, unchanged.
+      # failure, etc.) is NOT reclassified -- it propagates as
+      # Beagle::Turso::SyncError (or another Beagle::Turso::Error), unchanged.
       class NotSyncedError < StandardError; end
-
-      # Matches only the driver's local-only wording (see
-      # beagle_turso_core's `Error::Sync` in `Database::push`/`Database::pull`)
-      # so a real sync failure -- which also surfaces as a RuntimeError, just
-      # with different text -- is never misreported as "not synced".
-      LOCAL_ONLY_MESSAGE_REGEX = /on a local-only database/i
-      private_constant :LOCAL_ONLY_MESSAGE_REGEX
 
       module_function
 
@@ -88,9 +79,7 @@ module Beagle
 
       def reraise_local_only
         yield
-      rescue RuntimeError => e
-        raise e unless LOCAL_ONLY_MESSAGE_REGEX.match?(e.message)
-
+      rescue Beagle::Turso::NotSyncedError => e
         raise NotSyncedError,
           "#{e.message} -- this connection is local-only; configure remote_url: " \
           "and auth_token: in database.yml to enable sync"
