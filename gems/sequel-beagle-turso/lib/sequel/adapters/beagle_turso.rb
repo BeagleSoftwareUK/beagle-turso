@@ -8,8 +8,72 @@ module Sequel
   # replaces the plumbing (connections, execution, value conversion) and
   # papers over the engine's differences from SQLite.
   module BeagleTurso
-    # Value conversion by declared type (filled in by Task 2).
-    SQLITE_TYPES = {}.freeze
+    FALSE_VALUES = (%w[0 false f no n].each(&:freeze) + [0]).freeze
+
+    blob = Object.new
+    def blob.call(s)
+      Sequel::SQL::Blob.new(s.to_s)
+    end
+
+    boolean = Object.new
+    def boolean.call(s)
+      s = s.downcase if s.is_a?(String)
+      !FALSE_VALUES.include?(s)
+    end
+
+    date = Object.new
+    def date.call(s)
+      case s
+      when String then Sequel.string_to_date(s)
+      when Integer then Date.jd(s)
+      when Float then Date.jd(s.to_i)
+      else raise Sequel::Error, "unhandled type when converting to date: #{s.inspect} (#{s.class.inspect})"
+      end
+    end
+
+    integer = Object.new
+    def integer.call(s)
+      s.to_i
+    end
+
+    float = Object.new
+    def float.call(s)
+      s.to_f
+    end
+
+    numeric = Object.new
+    def numeric.call(s)
+      s = s.to_s unless s.is_a?(String)
+      BigDecimal(s)
+    rescue ArgumentError
+      s
+    end
+
+    time = Object.new
+    def time.call(s)
+      case s
+      when String then Sequel.string_to_time(s)
+      when Integer then Sequel::SQLTime.create(s / 3600, (s % 3600) / 60, s % 60)
+      when Float
+        secs, frac = s.divmod(1)
+        Sequel::SQLTime.create(secs / 3600, (secs % 3600) / 60, secs % 60, (frac * 1_000_000).round)
+      else raise Sequel::Error, "unhandled type when converting to time: #{s.inspect} (#{s.class.inspect})"
+      end
+    end
+
+    # Declared base type name (lowercase) -> converter. datetime/timestamp are
+    # added per Database so Sequel's timezone settings apply.
+    SQLITE_TYPES = {}
+    {
+      %w[date] => date,
+      %w[time] => time,
+      %w[bit bool boolean] => boolean,
+      %w[integer smallint mediumint int bigint] => integer,
+      %w[numeric decimal money] => numeric,
+      %w[float double real dec fixed] + ["double precision"] => float,
+      %w[blob] => blob
+    }.each { |names, conv| names.each { |n| SQLITE_TYPES[n] = conv } }
+    SQLITE_TYPES.freeze
 
     class Database < Sequel::Database
       include Sequel::SQLite::DatabaseMethods
@@ -82,10 +146,27 @@ module Sequel
         end
       end
 
+      # SQLite stores timestamps as text, integers (unix time) or reals (julian day).
+      def to_application_timestamp(s)
+        case s
+        when String then super
+        when Integer then super(Time.at(s).to_s)
+        when Float then super(DateTime.jd(s).to_s)
+        else raise Sequel::Error, "unhandled type when converting to timestamp: #{s.inspect} (#{s.class.inspect})"
+        end
+      end
+
+      def freeze
+        @conversion_procs.freeze
+        super
+      end
+
       private
 
       def adapter_initialize
         @conversion_procs = SQLITE_TYPES.dup
+        @conversion_procs["datetime"] = @conversion_procs["timestamp"] = method(:to_application_timestamp)
+        set_integer_booleans
         reject_url_credentials
         @turso_database, @owns_turso_database = open_turso_database
         scrub_credentials
