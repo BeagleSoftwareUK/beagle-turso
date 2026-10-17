@@ -29,7 +29,7 @@ mod error;
 mod runtime;
 mod value;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use runtime::{new_runtime, SharedRt};
 
@@ -100,14 +100,16 @@ enum Inner {
 /// and [`OpenOptions::auth_token`] are `None`; synced (with [`Database::push`]
 /// / [`Database::pull`]) when both are `Some`.
 ///
-/// `inner` is wrapped in a `Mutex<Option<_>>` so [`Database::close`] can drop
-/// the underlying engine handle (and, for a synced database, end its remote
-/// sync session) eagerly instead of waiting for GC. `None` means closed. A
-/// `Mutex` (not `RefCell`) is used so the type stays `Send + Sync`, which the
-/// Magnus wrap in the Ruby extension requires.
+/// The engine handle sits in a `Mutex<Option<Arc<_>>>`. Each operation clones
+/// the `Arc` and releases the mutex before doing any I/O, so a slow `push`
+/// never makes `connect`, `close` or `is_closed` wait. `close` takes the
+/// `Option`; an operation still in flight keeps its own `Arc` and finishes,
+/// and the engine is released when the last one drops. `None` means closed.
+/// `sync_lock` serializes `push`/`pull` against each other only.
 pub struct Database {
     rt: SharedRt,
-    inner: Mutex<Option<Inner>>,
+    inner: Mutex<Option<Arc<Inner>>>,
+    sync_lock: Mutex<()>,
 }
 
 /// A connection to a [`Database`], used to run SQL.
@@ -132,34 +134,41 @@ impl Database {
                         .bootstrap_if_empty(opts.bootstrap_if_empty)
                         .build()
                         .await
-                        .map_err(|e| Error::Open(e.to_string()))?;
+                        .map_err(|e| Error::from_engine(Error::Open, e))?;
                     Ok::<Inner, Error>(Inner::Synced(db))
                 }
                 _ => {
                     let db = turso::Builder::new_local(&opts.local_path)
                         .build()
                         .await
-                        .map_err(|e| Error::Open(e.to_string()))?;
+                        .map_err(|e| Error::from_engine(Error::Open, e))?;
                     Ok(Inner::Local(db))
                 }
             }
         })?;
         Ok(Database {
             rt,
-            inner: Mutex::new(Some(inner)),
+            inner: Mutex::new(Some(Arc::new(inner))),
+            sync_lock: Mutex::new(()),
         })
     }
 
-    pub fn connect(&self) -> Result<Connection> {
+    fn handle(&self) -> Result<Arc<Inner>> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        let conn = match inner {
-            Inner::Local(db) => db.connect().map_err(|e| Error::Connect(e.to_string()))?,
+        guard.as_ref().cloned().ok_or(Error::Closed)
+    }
+
+    pub fn connect(&self) -> Result<Connection> {
+        let inner = self.handle()?;
+        let conn = match &*inner {
+            Inner::Local(db) => db
+                .connect()
+                .map_err(|e| Error::from_engine(Error::Connect, e))?,
             // The synced database's connect() is async (unlike the local one).
             Inner::Synced(db) => self
                 .rt
                 .block_on(async { db.connect().await })
-                .map_err(|e| Error::Connect(e.to_string()))?,
+                .map_err(|e| Error::from_engine(Error::Connect, e))?,
         };
         Ok(Connection {
             rt: self.rt.clone(),
@@ -167,40 +176,43 @@ impl Database {
         })
     }
 
-    /// Push local changes to the remote. Errors if this database is
-    /// local-only (opened without `remote_url`/`auth_token`).
+    /// Push local changes to the remote. Errors with [`Error::NotSynced`] if
+    /// this database is local-only.
     pub fn push(&self) -> Result<()> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        match inner {
-            Inner::Local(_) => Err(Error::Sync("push() on a local-only database".into())),
-            Inner::Synced(db) => self
-                .rt
-                .block_on(async { db.push().await })
-                .map(|_| ())
-                .map_err(|e| Error::Sync(e.to_string())),
+        let inner = self.handle()?;
+        match &*inner {
+            Inner::Local(_) => Err(Error::NotSynced("push")),
+            Inner::Synced(db) => {
+                let _sync = self.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
+                self.rt
+                    .block_on(async { db.push().await })
+                    .map(|_| ())
+                    .map_err(|e| Error::from_engine(Error::Sync, e))
+            }
         }
     }
 
     /// Pull remote changes; returns `true` if any changes were applied.
-    /// Errors if this database is local-only (opened without
-    /// `remote_url`/`auth_token`).
+    /// Errors with [`Error::NotSynced`] if this database is local-only.
     pub fn pull(&self) -> Result<bool> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        match inner {
-            Inner::Local(_) => Err(Error::Sync("pull() on a local-only database".into())),
-            Inner::Synced(db) => self
-                .rt
-                .block_on(async { db.pull().await })
-                .map_err(|e| Error::Sync(e.to_string())),
+        let inner = self.handle()?;
+        match &*inner {
+            Inner::Local(_) => Err(Error::NotSynced("pull")),
+            Inner::Synced(db) => {
+                let _sync = self.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
+                self.rt
+                    .block_on(async { db.pull().await })
+                    .map_err(|e| Error::from_engine(Error::Sync, e))
+            }
         }
     }
 
     /// Close the database, releasing the underlying engine handle and — for a
     /// synced database — its remote sync session, instead of waiting for GC.
     /// Idempotent. After close, [`Database::connect`]/[`Database::push`]/
-    /// [`Database::pull`] return [`Error::Closed`].
+    /// [`Database::pull`] return [`Error::Closed`]. An operation already in
+    /// flight on another thread keeps its own reference and completes; the
+    /// engine is released when it finishes.
     ///
     /// The `turso` crate (v0.8.3) exposes no explicit async `close`/`shutdown`
     /// on `sync::Database`/`Connection`; teardown is via `Drop`. A synced
@@ -246,7 +258,7 @@ impl Connection {
         let result = self.rt.block_on(async {
             conn.execute(sql, tparams)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))
+                .map_err(|e| Error::from_engine(Error::Query, e))
         });
         result
     }
@@ -266,17 +278,23 @@ impl Connection {
             let mut rows = conn
                 .query(sql, tparams)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+                .map_err(|e| Error::from_engine(Error::Query, e))?;
             // turso::Rows::column_names() reads column metadata off the
             // prepared statement, so it's available up front (no need to
             // step first) and stays fixed across the whole result set.
             let columns = rows.column_names();
             let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(|e| Error::Query(e.to_string()))? {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| Error::from_engine(Error::Query, e))?
+            {
                 let n = row.column_count();
                 let mut vals = Vec::with_capacity(n);
                 for i in 0..n {
-                    let cv = row.get_value(i).map_err(|e| Error::Query(e.to_string()))?;
+                    let cv = row
+                        .get_value(i)
+                        .map_err(|e| Error::from_engine(Error::Query, e))?;
                     vals.push(Value::from_turso(cv));
                 }
                 out.push(Row { values: vals });
@@ -312,7 +330,7 @@ impl Connection {
         let result = self.rt.block_on(async {
             conn.execute_batch(sql)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))
+                .map_err(|e| Error::from_engine(Error::Query, e))
         });
         result
     }
