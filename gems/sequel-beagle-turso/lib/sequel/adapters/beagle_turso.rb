@@ -260,6 +260,25 @@ module Sequel
       def dataset_class_default
         Dataset
       end
+
+      # The engine reports `to` as "" (SQLite: NULL) for a foreign key that
+      # references the parent's primary key implicitly. Sequel would turn that
+      # into a bogus column and break table rebuilds in alter_table.
+      def _foreign_key_list_ds(table)
+        super.with_row_proc(lambda do |row|
+          row[:to] = nil if row[:to] == ""
+          row
+        end)
+      end
+
+      # AUTOINCREMENT tables get engine bookkeeping tables in sqlite_master.
+      def tables_and_views(filter, opts)
+        super.reject { |name| name.to_s.start_with?("__turso_internal_") }
+      end
+
+      def support_without_rowid?
+        false
+      end
     end
 
     class Dataset < Sequel::Dataset
