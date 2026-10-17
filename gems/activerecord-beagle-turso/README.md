@@ -228,15 +228,17 @@ this gem.
 
 ## Known engine issue: self-referencing foreign keys
 
-For a table whose foreign key points at itself (such as a tree-shaped model
-with `parent_id`), the engine checks the constraint per row instead of per
-statement. A multi-row `delete_all` or `update_all`, or a `DROP TABLE`, that
-would be valid at the end of the statement raises `FOREIGN KEY constraint
-failed`. With `ON DELETE SET NULL` (or `dependent: :nullify`), a multi-row
-`delete_all` can silently leave rows behind. Foreign keys between two tables
-are unaffected, and `ON DELETE CASCADE` works. Workarounds: delete children
-before parents, or use `CASCADE`, and avoid `SET NULL` / `dependent: :nullify`
-on self-referencing foreign keys.
+Turso's engine has open bugs with foreign keys that reference their own table
+(such as `parent_id`): a multi-row `delete_all`, `update_all` or `DROP TABLE` that SQLite accepts can fail with
+`FOREIGN KEY constraint failed`, and `ON DELETE SET NULL` / `CASCADE` can leave
+rows behind or orphaned
+([tursodatabase/turso#8713](https://github.com/tursodatabase/turso/issues/8713),
+[#9279](https://github.com/tursodatabase/turso/issues/9279),
+[#9293](https://github.com/tursodatabase/turso/issues/9293),
+[#9294](https://github.com/tursodatabase/turso/issues/9294)). Foreign keys
+between two different tables are unaffected. Workaround: avoid `ON DELETE`
+actions on self-referencing foreign keys, and delete children before parents,
+one level at a time.
 
 ## License
 

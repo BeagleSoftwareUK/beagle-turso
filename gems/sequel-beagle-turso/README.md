@@ -119,15 +119,17 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
 - Dropping a self-referencing table that has rows works outside a transaction
   only (the adapter retries with foreign keys off). Inside a transaction it
   raises.
-- **Known engine issue: self-referencing foreign keys.** For a table whose
-  foreign key points at itself (such as `parent_id`), the engine checks the
-  constraint per row instead of per statement. A multi-row `DELETE`, `UPDATE`
-  or `DROP` that would be valid at the end of the statement raises
-  `FOREIGN KEY constraint failed`. With `ON DELETE SET NULL`, a multi-row
-  `DELETE` can silently leave rows behind. Foreign keys between two tables are
-  unaffected, and `ON DELETE CASCADE` works. Workarounds: delete children
-  before parents, or use `CASCADE`, and avoid `SET NULL` on self-referencing
-  foreign keys.
+- **Known engine issue: self-referencing foreign keys.** Turso's engine has open bugs with foreign keys that reference their own table
+  (such as `parent_id`): a multi-row `DELETE`, `UPDATE` or `DROP` that SQLite accepts can fail with
+  `FOREIGN KEY constraint failed`, and `ON DELETE SET NULL` / `CASCADE` can leave
+  rows behind or orphaned
+  ([tursodatabase/turso#8713](https://github.com/tursodatabase/turso/issues/8713),
+  [#9279](https://github.com/tursodatabase/turso/issues/9279),
+  [#9293](https://github.com/tursodatabase/turso/issues/9293),
+  [#9294](https://github.com/tursodatabase/turso/issues/9294)). Foreign keys
+  between two different tables are unaffected. Workaround: avoid `ON DELETE`
+  actions on self-referencing foreign keys, and delete children before parents,
+  one level at a time.
 
 The full list of Sequel integration tests excluded for engine gaps, with a
 reason for each, is in
