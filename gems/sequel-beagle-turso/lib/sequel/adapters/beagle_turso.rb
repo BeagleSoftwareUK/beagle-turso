@@ -78,6 +78,10 @@ module Sequel
     class Database < Sequel::Database
       include Sequel::SQLite::DatabaseMethods
 
+      # The driver prefixes engine messages ("query failed: ..."); Sequel's
+      # SQLite error regexps (some anchored at \A) expect the bare message.
+      ENGINE_PREFIX = /\A(?:open failed|connect failed|query failed|sync failed|database is busy): /
+
       set_adapter_scheme :beagle_turso
       # The URL form: URI schemes can't contain "_" (see adapters/beagle-turso.rb).
       Sequel::ADAPTER_MAP[:"beagle-turso"] = self
@@ -227,6 +231,23 @@ module Sequel
 
       def database_error_classes
         [Beagle::Turso::Error]
+      end
+
+      def database_specific_error_class(exception, opts)
+        return DatabaseDisconnectError if disconnect_error?(exception, opts)
+
+        if exception.is_a?(Beagle::Turso::BusyError)
+          return exception.message.include?("snapshot is stale") ? SerializationFailure : DatabaseLockTimeout
+        end
+
+        message = exception.message.sub(ENGINE_PREFIX, "")
+        database_error_regexps.each { |regexp, klass| return klass if regexp.match?(message) }
+        nil
+      end
+
+      # A closed or fork-inherited connection is dead: let the pool drop it.
+      def disconnect_error?(exception, opts)
+        exception.is_a?(Beagle::Turso::ClosedError) || exception.is_a?(Beagle::Turso::ForkedError) || super
       end
 
       # Only reads @opts: Sequel calls this before adapter_initialize.
