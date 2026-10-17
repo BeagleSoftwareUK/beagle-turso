@@ -30,7 +30,7 @@ RSpec.describe "Database identity" do
       expect(db.synced?).to be(true)
       expect(db.remote_host).to eq(Beagle::Turso::Redaction.host(url))
       expect(db.remote_host).not_to include("://")
-      expect(db.remote_host).not_to include(token)
+      expect(db.remote_host.include?(token)).to be(false)
       db.close
     end
   end
