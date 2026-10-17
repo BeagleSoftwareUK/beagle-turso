@@ -390,6 +390,34 @@ module Sequel
         end)
       end
 
+      # Sequel rebuilds a table by renaming it to a backup, creating the new
+      # table, copying and dropping the backup, relying on legacy_alter_table
+      # to stop the rename touching other tables. The engine ignores that
+      # pragma and rewrites their foreign keys (and views) to the backup name,
+      # which is then dropped. So build the new table under the backup name,
+      # copy, drop the original, and rename the new table into place: nothing
+      # refers to the backup name, so the rename rewrites nothing else.
+      def duplicate_table(table, opts = OPTS)
+        rename, create, insert, drop, *rest = super
+        qt = quote_schema_table(table)
+        bt = drop.to_s.delete_prefix("DROP TABLE ")
+        create_prefix = "CREATE TABLE #{qt}("
+        insert_prefix = "INSERT INTO #{qt}("
+        unless rename == "ALTER TABLE #{qt} RENAME TO #{bt}" && create.start_with?(create_prefix) &&
+            insert.start_with?(insert_prefix) && insert.end_with?(" FROM #{bt}")
+          raise Error, "unexpected table rebuild SQL from Sequel #{Sequel::VERSION}; cannot rebuild #{qt}"
+        end
+
+        columns = insert.delete_prefix(insert_prefix).delete_suffix(" FROM #{bt}")
+        [
+          "CREATE TABLE #{bt}(#{create.delete_prefix(create_prefix)}",
+          "INSERT INTO #{bt}(#{columns} FROM #{qt}",
+          "DROP TABLE #{qt}",
+          "ALTER TABLE #{bt} RENAME TO #{qt}",
+          *rest
+        ]
+      end
+
       # AUTOINCREMENT tables get engine bookkeeping tables in sqlite_master.
       def tables_and_views(filter, opts)
         super.reject { |name| name.to_s.start_with?("__turso_internal_") }

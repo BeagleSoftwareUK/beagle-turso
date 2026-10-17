@@ -77,4 +77,24 @@ RSpec.describe "Sequel::BeagleTurso schema handling" do
     db.run("CREATE TABLE r (x integer DEFAULT ((1)))")
     expect(db.schema(:r).first.last[:default]).to eq("(1)") # SQLite strips one pair only
   end
+
+  # Sequel integration: "Database foreign key parsing ... should parse foreign
+  # key information into an array of hashes". The engine ignores
+  # legacy_alter_table, so Sequel's rename-to-backup rebuild pointed other
+  # tables' foreign keys at the dropped backup table.
+  it "keeps other tables' foreign keys pointing at a table that alter_table rebuilds" do
+    db.create_table(:a) { primary_key :id; Integer :n; index :n }
+    db.create_table(:b) { primary_key :id; foreign_key :a_id, :a }
+    db.create_view(:v, db[:a])
+    db[:a].insert(id: 1, n: 5)
+    db[:b].insert(a_id: 1)
+    db.alter_table(:a) { set_column_not_null :n }
+    expect(db.foreign_key_list(:b).map { |fk| fk[:table] }).to eq([:a])
+    expect(db.tables.sort).to eq([:a, :b])
+    expect(db.indexes(:a).values.map { |i| i[:columns] }).to eq([[:n]])
+    expect(db[:v].all).to eq([{ id: 1, n: 5 }])
+    expect(db.schema(:a, reload: true).to_h[:n][:allow_null]).to be(false)
+    db[:b].insert(a_id: 1)
+    expect { db[:b].insert(a_id: 99) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
+  end
 end
