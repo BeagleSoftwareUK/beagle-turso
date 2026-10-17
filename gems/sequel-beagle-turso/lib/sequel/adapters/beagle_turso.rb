@@ -192,6 +192,16 @@ module Sequel
         nil
       end
 
+      # Sequel's check sends SELECT NULL through connection_execute_method
+      # (execute_batch), which rejects any statement that returns a row.
+      def valid_connection?(conn)
+        sql = valid_connection_sql
+        log_connection_yield(sql, conn) { conn.query(sql, []) }
+        true
+      rescue Sequel::DatabaseError, *database_error_classes
+        false
+      end
+
       def freeze
         @conversion_procs.freeze
         super

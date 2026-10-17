@@ -114,4 +114,16 @@ RSpec.describe "Sequel::BeagleTurso connection" do
       db.close_replica
     end
   end
+
+  # Sequel integration: "Sequel::Database ... should provide ability to check
+  # connections for validity". The check query returns a row, which the
+  # driver's execute_batch rejects, so every connection looked invalid.
+  it "reports live connections as valid and closed ones as invalid" do
+    db = Sequel.connect(adapter: :beagle_turso, database: tmp_db)
+    conn = db.synchronize { |c| c }
+    expect(db.valid_connection?(conn)).to be(true)
+    db.disconnect
+    expect(db.valid_connection?(conn)).to be(false)
+    db.close_replica
+  end
 end
