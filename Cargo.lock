@@ -191,6 +191,7 @@ name = "beagle_turso_core"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "libc",
  "thiserror",
  "tokio",
  "turso",

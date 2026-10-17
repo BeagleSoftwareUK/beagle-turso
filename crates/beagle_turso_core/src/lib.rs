@@ -29,12 +29,25 @@ mod error;
 mod runtime;
 mod value;
 
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use runtime::{new_runtime, SharedRt};
 
 pub use error::{Error, Result};
 pub use value::Value;
+
+/// Errors with [`Error::Forked`] when called in a process other than the one
+/// that opened the handle. The parent's Tokio worker thread and engine state
+/// do not survive `fork`, so an inherited handle must never be used.
+fn check_pid(opened: u32) -> Result<()> {
+    let current = std::process::id();
+    if current == opened {
+        Ok(())
+    } else {
+        Err(Error::Forked { opened, current })
+    }
+}
 
 /// Options controlling how a [`Database`] is opened.
 #[derive(Clone)]
@@ -106,8 +119,10 @@ enum Inner {
 /// `Option`; an operation still in flight keeps its own `Arc` and finishes,
 /// and the engine is released when the last one drops. `None` means closed.
 /// `sync_lock` serializes `push`/`pull` against each other only.
+/// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Database {
-    rt: SharedRt,
+    rt: ManuallyDrop<SharedRt>,
+    pid: u32,
     inner: Mutex<Option<Arc<Inner>>>,
     sync_lock: Mutex<()>,
 }
@@ -117,8 +132,10 @@ pub struct Database {
 /// `conn` is a `Mutex<Option<_>>` for the same reasons as [`Database::inner`]:
 /// [`Connection::close`] can release the handle eagerly, `None` means closed,
 /// and the `Mutex` keeps the type `Send + Sync` for the Magnus wrap.
+/// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Connection {
-    rt: SharedRt,
+    rt: ManuallyDrop<SharedRt>,
+    pid: u32,
     conn: Mutex<Option<turso::Connection>>,
 }
 
@@ -147,13 +164,15 @@ impl Database {
             }
         })?;
         Ok(Database {
-            rt,
+            rt: ManuallyDrop::new(rt),
+            pid: std::process::id(),
             inner: Mutex::new(Some(Arc::new(inner))),
             sync_lock: Mutex::new(()),
         })
     }
 
     fn handle(&self) -> Result<Arc<Inner>> {
+        check_pid(self.pid)?;
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.as_ref().cloned().ok_or(Error::Closed)
     }
@@ -171,7 +190,8 @@ impl Database {
                 .map_err(|e| Error::from_engine(Error::Connect, e))?,
         };
         Ok(Connection {
-            rt: self.rt.clone(),
+            rt: ManuallyDrop::new((*self.rt).clone()),
+            pid: self.pid,
             conn: Mutex::new(Some(conn)),
         })
     }
@@ -226,6 +246,12 @@ impl Database {
     /// immediately; it is kept purely as a harmless defensive wrapper (a live
     /// reactor is in scope if a future turso version ever needs one on drop).
     pub fn close(&self) {
+        if check_pid(self.pid).is_err() {
+            // Forked child: dropping the engine could block on the parent's
+            // worker thread. Leak it; the child's exit reclaims the memory.
+            std::mem::forget(self.inner.lock().unwrap_or_else(|p| p.into_inner()).take());
+            return;
+        }
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
         if inner.is_some() {
             self.rt.block_on(async move { drop(inner) });
@@ -243,15 +269,21 @@ impl Database {
 
 impl Drop for Database {
     /// Backstop: a consumer that drops the handle without calling
-    /// [`Database::close`] still releases the session uniformly. Idempotent
-    /// with an explicit prior close (`close` no-ops once `inner` is `None`).
+    /// [`Database::close`] still releases the session uniformly. In a forked
+    /// child, `close` leaks the engine and the runtime is not dropped either
+    /// (its worker thread only exists in the parent).
     fn drop(&mut self) {
         self.close();
+        if check_pid(self.pid).is_ok() {
+            // SAFETY: `rt` is never used again after this point.
+            unsafe { ManuallyDrop::drop(&mut self.rt) };
+        }
     }
 }
 
 impl Connection {
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
@@ -271,6 +303,7 @@ impl Connection {
     /// names — needed by callers (e.g. an ActiveRecord adapter) that must
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
@@ -312,6 +345,7 @@ impl Connection {
     /// method's signature for API consistency with the rest of `Connection`,
     /// even though the underlying call cannot fail.
     pub fn last_insert_rowid(&self) -> Result<i64> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         Ok(conn.last_insert_rowid())
@@ -325,6 +359,7 @@ impl Connection {
     /// `;` — so statements containing `;` inside string literals (e.g.
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let result = self.rt.block_on(async {
@@ -343,6 +378,12 @@ impl Connection {
     /// as a harmless defensive wrapper — turso 0.8.3's `Connection` has no
     /// custom `Drop` that awaits, so this resolves immediately.
     pub fn close(&self) {
+        if check_pid(self.pid).is_err() {
+            // Forked child: dropping the engine could block on the parent's
+            // worker thread. Leak it; the child's exit reclaims the memory.
+            std::mem::forget(self.conn.lock().unwrap_or_else(|p| p.into_inner()).take());
+            return;
+        }
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner()).take();
         if conn.is_some() {
             self.rt.block_on(async move { drop(conn) });
@@ -359,10 +400,12 @@ impl Connection {
 }
 
 impl Drop for Connection {
-    /// Backstop mirroring [`Database`]'s: dropping a `Connection` without an
-    /// explicit [`Connection::close`] still releases the handle uniformly.
-    /// Idempotent with a prior close.
+    /// Mirrors [`Database`]'s `Drop`, including the forked-child leak.
     fn drop(&mut self) {
         self.close();
+        if check_pid(self.pid).is_ok() {
+            // SAFETY: `rt` is never used again after this point.
+            unsafe { ManuallyDrop::drop(&mut self.rt) };
+        }
     }
 }

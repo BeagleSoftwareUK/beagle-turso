@@ -14,3 +14,6 @@ thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
