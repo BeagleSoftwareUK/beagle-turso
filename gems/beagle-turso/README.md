@@ -127,9 +127,8 @@ still a `RuntimeError`. A replica file already held by another process raises
 - `open`, `connect`, `push` and `pull` release the GVL, so other threads keep
   running while they wait on the network. Queries keep it; they are local and
   fast.
-- While one thread pushes, `closed?` and `connect` return immediately on other
-  threads, and queries on other connections proceed (measured worst case
-  ~3 ms vs ~0.15 s pushes).
+- While one thread pushes, `closed?` returns immediately on other threads, and
+  queries on other connections proceed.
 - On a synced database, `connect` called while another thread is pushing waits
   inside the engine until the push finishes (about the push's duration); the
   GVL is released while it waits, so other threads and fibers keep running.
@@ -148,8 +147,9 @@ still a `RuntimeError`. A replica file already held by another process raises
   process per replica (`--count 1`): the replica file is locked to one
   process.
 - **Fork:** handles are bound to the process that opened them. In a forked
-  child every call raises `ForkedError`; open a new database there. Inherited
-  handles need no cleanup in the child.
+  child, `open`, `connect`, `push`, `pull` and queries on an inherited handle
+  raise `ForkedError`; open a new database there. `close` and `closed?` are
+  safe no-ops, so inherited handles need no cleanup in the child.
 
 ## Credential safety
 
