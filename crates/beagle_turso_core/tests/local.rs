@@ -81,3 +81,26 @@ fn query_result_exposes_column_names() {
         vec![Value::Integer(1), Value::Text("a".into())]
     );
 }
+
+#[test]
+fn query_result_carries_declared_types() {
+    let db = beagle_turso_core::Database::open(beagle_turso_core::OpenOptions::default()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (d DATE, b BOOLEAN, n)", &[])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('2026-10-17', 1, 2)", &[])
+        .unwrap();
+    let r = conn
+        .query_result("SELECT d, b, n, 1 + 1 AS expr FROM t", &[])
+        .unwrap();
+    assert_eq!(r.columns, vec!["d", "b", "n", "expr"]);
+    assert_eq!(
+        r.decl_types,
+        vec![
+            Some("DATE".to_string()),
+            Some("BOOLEAN".to_string()),
+            None,
+            None
+        ]
+    );
+}

@@ -2,3 +2,4 @@ source "https://rubygems.org"
 gemspec
 gem "rake-compiler"
 gem "rspec"
+gem "async", ">= 2.25.0", require: false

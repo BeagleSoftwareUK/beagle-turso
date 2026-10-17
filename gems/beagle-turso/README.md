@@ -68,7 +68,8 @@ db.pull # pull remote changes down to the local file (returns true/false)
 `Database.open` also accepts `bootstrap_if_empty:` (defaults to `true`),
 which pulls all remote data down on first open if the local file is new/empty.
 Calling `push`/`pull` on a database opened via `open_local` (or via `open`
-without both `remote_url:` and `auth_token:`) raises `RuntimeError`.
+without both `remote_url:` and `auth_token:`) raises
+`Beagle::Turso::NotSyncedError`.
 
 ### Durability note: writes commit on-sync, not synchronously
 
@@ -102,6 +103,54 @@ Two things to avoid:
 
 A single remote database, dedicated to this engine and written by one process
 at a time, is the model it's built for.
+
+## Errors
+
+Every error the driver raises is a `Beagle::Turso::Error`, a `RuntimeError`
+subclass: `OpenError`, `ConnectError`, `QueryError`, `SyncError`,
+`NotSyncedError` (push/pull on a local-only database), `BusyError` (another
+session or process holds the database), `ClosedError` and `ForkedError`. An
+unsupported bind parameter type raises Ruby's `TypeError`. Auth, network and
+protocol failures during sync all arrive as `SyncError` (or `OpenError` at
+open): the engine does not distinguish them. Messages never contain the auth
+token.
+
+Busy conditions now raise `BusyError` with a message beginning
+`database is busy:` (0.1.x said `query failed:` / `sync failed:`); it is
+still a `RuntimeError`. A replica file already held by another process raises
+`OpenError` ("... File is locked by another process").
+
+## Threads, fibers and fork
+
+- One `Database` may be shared by threads. Give each thread its own
+  `Connection`; a shared `Connection` works but serializes its callers.
+- `open`, `connect`, `push` and `pull` release the GVL, so other threads keep
+  running while they wait on the network. Queries keep it; they are local and
+  fast.
+- While one thread pushes, `closed?` returns immediately on other threads, and
+  queries on other connections proceed.
+- On a synced database, `connect` called while another thread is pushing waits
+  inside the engine until the push finishes (about the push's duration); the
+  GVL is released while it waits, so other threads and fibers keep running.
+  Open connections up front (e.g. at boot / pool warm-up) rather than per
+  request.
+- `close` during an in-flight `push` is safe: the push finishes or raises, and
+  later calls raise `ClosedError`.
+- A blocked native call cannot be interrupted: `Timeout` and `Thread#kill`
+  take effect when it returns.
+- **Falcon / Async:** on Ruby 4.0+ with `async` 2.25+ (enable its worker pool
+  with `ASYNC_SCHEDULER_WORKER_POOL=true` or
+  `Async::Scheduler.new(worker_pool: true)`), a fiber scheduler runs these
+  calls on a worker thread, so the reactor keeps serving other requests during
+  a sync. On Ruby 3.3/3.4 the GVL is still released, but the scheduler's own
+  thread blocks. Run sync from a dedicated thread there. Run one Falcon
+  process per replica (`--count 1`): the replica file is locked to one
+  process.
+- **Fork:** handles are bound to the process that opened them. In a forked
+  child, `open`, `connect`, `push`, `pull` and queries on an inherited handle
+  raise `ForkedError`; open a new database there. `close` is a no-op and
+  `closed?` is safe (it reports the handle as closed if it can't be inspected),
+  so inherited handles need no cleanup in the child.
 
 ## Credential safety
 

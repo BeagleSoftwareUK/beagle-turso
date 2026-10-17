@@ -145,11 +145,12 @@ Three things bite hard enough to call out here, each covered in the
 crates/beagle_turso_core/          # the Rust sync core (published to crates.io)
 gems/beagle-turso/                 # the native-extension driver gem
 gems/activerecord-beagle-turso/    # the ActiveRecord adapter gem
-docs/                              # the Rails app setup guide
+docs/                              # the Rails app setup guide and the release runbook
 ```
 
 Releases are cut by tagging `vX.Y.Z`; CI cross-compiles the precompiled gems and
 publishes all three packages via trusted publishing (OIDC, no stored tokens).
+See [Releasing](docs/releasing.md) for the checklist, verification and rollback.
 
 ## Status
 

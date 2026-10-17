@@ -94,7 +94,7 @@ All three default their `connection` argument to `ActiveRecord::Base.connection`
 so `Beagle::Turso::SyncManager.sync!` alone is the usual call. Calling any of
 them against a **local-only** connection (no `remote_url:`/`auth_token:` in
 `database.yml`) raises `Beagle::Turso::SyncManager::NotSyncedError` — a
-distinct, rescuable type — rather than the driver's bare `RuntimeError`.
+distinct, rescuable type — rather than the driver's own `Beagle::Turso::NotSyncedError`.
 
 To sync on a timer, wire
 `ActiveRecord::ConnectionAdapters::BeagleTurso::SyncJob` (a thin delegator to

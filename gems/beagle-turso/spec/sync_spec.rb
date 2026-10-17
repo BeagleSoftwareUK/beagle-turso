@@ -24,7 +24,7 @@ RSpec.describe "synced mode" do
 
   it "raises when push/pull is called on a local-only database" do
     db = Beagle::Turso::Database.open_local(":memory:")
-    expect { db.push }.to raise_error(RuntimeError, /push/)
-    expect { db.pull }.to raise_error(RuntimeError, /pull/)
+    expect { db.push }.to raise_error(Beagle::Turso::NotSyncedError, /push/)
+    expect { db.pull }.to raise_error(Beagle::Turso::NotSyncedError, /pull/)
   end
 end

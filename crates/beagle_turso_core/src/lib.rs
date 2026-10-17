@@ -29,12 +29,25 @@ mod error;
 mod runtime;
 mod value;
 
-use std::sync::Mutex;
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex};
 
 use runtime::{new_runtime, SharedRt};
 
 pub use error::{Error, Result};
 pub use value::Value;
+
+/// Errors with [`Error::Forked`] when called in a process other than the one
+/// that opened the handle. The parent's Tokio worker thread and engine state
+/// do not survive `fork`, so an inherited handle must never be used.
+fn check_pid(opened: u32) -> Result<()> {
+    let current = std::process::id();
+    if current == opened {
+        Ok(())
+    } else {
+        Err(Error::Forked { opened, current })
+    }
+}
 
 /// Options controlling how a [`Database`] is opened.
 #[derive(Clone)]
@@ -86,6 +99,8 @@ pub struct Row {
 /// alongside the rows, since [`Row`] alone carries no column metadata.
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// Declared type per column (None for expressions or untyped columns).
+    pub decl_types: Vec<Option<String>>,
     pub rows: Vec<Row>,
 }
 
@@ -100,14 +115,18 @@ enum Inner {
 /// and [`OpenOptions::auth_token`] are `None`; synced (with [`Database::push`]
 /// / [`Database::pull`]) when both are `Some`.
 ///
-/// `inner` is wrapped in a `Mutex<Option<_>>` so [`Database::close`] can drop
-/// the underlying engine handle (and, for a synced database, end its remote
-/// sync session) eagerly instead of waiting for GC. `None` means closed. A
-/// `Mutex` (not `RefCell`) is used so the type stays `Send + Sync`, which the
-/// Magnus wrap in the Ruby extension requires.
+/// The engine handle sits in a `Mutex<Option<Arc<_>>>`. Each operation clones
+/// the `Arc` and releases the mutex before doing any I/O, so a slow `push`
+/// never makes `connect`, `close` or `is_closed` wait. `close` takes the
+/// `Option`; an operation still in flight keeps its own `Arc` and finishes,
+/// and the engine is released when the last one drops. `None` means closed.
+/// `sync_lock` serializes `push`/`pull` against each other only.
+/// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Database {
-    rt: SharedRt,
-    inner: Mutex<Option<Inner>>,
+    rt: ManuallyDrop<SharedRt>,
+    pid: u32,
+    inner: Mutex<Option<Arc<Inner>>>,
+    sync_lock: Mutex<()>,
 }
 
 /// A connection to a [`Database`], used to run SQL.
@@ -115,8 +134,10 @@ pub struct Database {
 /// `conn` is a `Mutex<Option<_>>` for the same reasons as [`Database::inner`]:
 /// [`Connection::close`] can release the handle eagerly, `None` means closed,
 /// and the `Mutex` keeps the type `Send + Sync` for the Magnus wrap.
+/// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Connection {
-    rt: SharedRt,
+    rt: ManuallyDrop<SharedRt>,
+    pid: u32,
     conn: Mutex<Option<turso::Connection>>,
 }
 
@@ -132,88 +153,115 @@ impl Database {
                         .bootstrap_if_empty(opts.bootstrap_if_empty)
                         .build()
                         .await
-                        .map_err(|e| Error::Open(e.to_string()))?;
+                        .map_err(|e| Error::from_engine(Error::Open, e))?;
                     Ok::<Inner, Error>(Inner::Synced(db))
                 }
                 _ => {
                     let db = turso::Builder::new_local(&opts.local_path)
                         .build()
                         .await
-                        .map_err(|e| Error::Open(e.to_string()))?;
+                        .map_err(|e| Error::from_engine(Error::Open, e))?;
                     Ok(Inner::Local(db))
                 }
             }
         })?;
         Ok(Database {
-            rt,
-            inner: Mutex::new(Some(inner)),
+            rt: ManuallyDrop::new(rt),
+            pid: std::process::id(),
+            inner: Mutex::new(Some(Arc::new(inner))),
+            sync_lock: Mutex::new(()),
         })
     }
 
-    pub fn connect(&self) -> Result<Connection> {
+    fn handle(&self) -> Result<Arc<Inner>> {
+        check_pid(self.pid)?;
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        let conn = match inner {
-            Inner::Local(db) => db.connect().map_err(|e| Error::Connect(e.to_string()))?,
+        guard.as_ref().cloned().ok_or(Error::Closed)
+    }
+
+    pub fn connect(&self) -> Result<Connection> {
+        let inner = self.handle()?;
+        let conn = match &*inner {
+            Inner::Local(db) => db
+                .connect()
+                .map_err(|e| Error::from_engine(Error::Connect, e))?,
             // The synced database's connect() is async (unlike the local one).
             Inner::Synced(db) => self
                 .rt
                 .block_on(async { db.connect().await })
-                .map_err(|e| Error::Connect(e.to_string()))?,
+                .map_err(|e| Error::from_engine(Error::Connect, e))?,
         };
         Ok(Connection {
-            rt: self.rt.clone(),
+            rt: ManuallyDrop::new((*self.rt).clone()),
+            pid: self.pid,
             conn: Mutex::new(Some(conn)),
         })
     }
 
-    /// Push local changes to the remote. Errors if this database is
-    /// local-only (opened without `remote_url`/`auth_token`).
+    /// Push local changes to the remote. Errors with [`Error::NotSynced`] if
+    /// this database is local-only.
     pub fn push(&self) -> Result<()> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        match inner {
-            Inner::Local(_) => Err(Error::Sync("push() on a local-only database".into())),
-            Inner::Synced(db) => self
-                .rt
-                .block_on(async { db.push().await })
-                .map(|_| ())
-                .map_err(|e| Error::Sync(e.to_string())),
+        let inner = self.handle()?;
+        match &*inner {
+            Inner::Local(_) => Err(Error::NotSynced("push")),
+            Inner::Synced(db) => {
+                let _sync = self.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
+                self.rt
+                    .block_on(async { db.push().await })
+                    .map(|_| ())
+                    .map_err(|e| Error::from_engine(Error::Sync, e))
+            }
         }
     }
 
     /// Pull remote changes; returns `true` if any changes were applied.
-    /// Errors if this database is local-only (opened without
-    /// `remote_url`/`auth_token`).
+    /// Errors with [`Error::NotSynced`] if this database is local-only.
     pub fn pull(&self) -> Result<bool> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let inner = guard.as_ref().ok_or(Error::Closed)?;
-        match inner {
-            Inner::Local(_) => Err(Error::Sync("pull() on a local-only database".into())),
-            Inner::Synced(db) => self
-                .rt
-                .block_on(async { db.pull().await })
-                .map_err(|e| Error::Sync(e.to_string())),
+        let inner = self.handle()?;
+        match &*inner {
+            Inner::Local(_) => Err(Error::NotSynced("pull")),
+            Inner::Synced(db) => {
+                let _sync = self.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
+                self.rt
+                    .block_on(async { db.pull().await })
+                    .map_err(|e| Error::from_engine(Error::Sync, e))
+            }
         }
     }
 
     /// Close the database, releasing the underlying engine handle and — for a
     /// synced database — its remote sync session, instead of waiting for GC.
     /// Idempotent. After close, [`Database::connect`]/[`Database::push`]/
-    /// [`Database::pull`] return [`Error::Closed`].
+    /// [`Database::pull`] return [`Error::Closed`]. An operation already in
+    /// flight on another thread keeps its own reference and completes; the
+    /// engine is released when it finishes.
     ///
-    /// The `turso` crate (v0.7.2) exposes no explicit async `close`/`shutdown`
+    /// The `turso` crate (v0.8.3) exposes no explicit async `close`/`shutdown`
     /// on `sync::Database`/`Connection`; teardown is via `Drop`. A synced
     /// `turso::sync::Database` runs its IO on an independent worker thread that
     /// holds only a `Weak` reference to the sync engine; dropping the last
     /// strong handle (our `Inner`) closes the worker's mpsc channel and lets
     /// its `Weak::upgrade` fail, so the worker loop exits and the sync engine
-    /// is released — that is what ends the server-side session. turso 0.7.2 has
+    /// is released — that is what ends the server-side session. turso 0.8.3 has
     /// no custom `Drop` that touches the *current* runtime, so the
     /// `block_on(async move { drop(inner) })` below has no await and resolves
     /// immediately; it is kept purely as a harmless defensive wrapper (a live
     /// reactor is in scope if a future turso version ever needs one on drop).
     pub fn close(&self) {
+        if check_pid(self.pid).is_err() {
+            // Forked child: dropping the engine could block on the parent's
+            // worker thread. Leak it; the child's exit reclaims the memory.
+            // `try_lock`, because a parent thread may have held the mutex at
+            // fork time, leaving it locked with no owner in the child.
+            match self.inner.try_lock() {
+                Ok(mut g) => std::mem::forget(g.take()),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    std::mem::forget(p.into_inner().take())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            return;
+        }
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
         if inner.is_some() {
             self.rt.block_on(async move { drop(inner) });
@@ -222,6 +270,16 @@ impl Database {
 
     /// Whether this database has been closed (see [`Database::close`]).
     pub fn is_closed(&self) -> bool {
+        if check_pid(self.pid).is_err() {
+            // Forked child: an inherited handle is unusable, so "closed" is the
+            // honest answer, and the mutex may be held by a thread that no
+            // longer exists here.
+            return match self.inner.try_lock() {
+                Ok(g) => g.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            };
+        }
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -231,71 +289,34 @@ impl Database {
 
 impl Drop for Database {
     /// Backstop: a consumer that drops the handle without calling
-    /// [`Database::close`] still releases the session uniformly. Idempotent
-    /// with an explicit prior close (`close` no-ops once `inner` is `None`).
+    /// [`Database::close`] still releases the session uniformly. In a forked
+    /// child, `close` leaks the engine and the runtime is not dropped either
+    /// (its worker thread only exists in the parent).
     fn drop(&mut self) {
+        if check_pid(self.pid).is_err() {
+            // `get_mut` never touches the futex (`&mut self` proves exclusive
+            // access), so a lock held by a vanished parent thread can't hang us.
+            let slot = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
+            std::mem::forget(slot.take());
+            return;
+        }
         self.close();
+        // SAFETY: `rt` is never used again after this point.
+        unsafe { ManuallyDrop::drop(&mut self.rt) };
     }
-}
-
-/// Does this SQL reference a pragma table-valued function (`pragma_table_list`,
-/// `pragma_table_info`, `pragma_database_list`, ...)?
-///
-/// Deliberately a cheap substring test rather than a parse: a false positive
-/// (a user table or string literal containing `pragma_`) only costs one empty
-/// BEGIN/COMMIT pair, whereas a false negative silently loses writes. See
-/// [`Connection::repair_pragma_tvf_wedge`].
-fn uses_pragma_tvf(sql: &str) -> bool {
-    sql.as_bytes()
-        .windows(7)
-        .any(|w| w.eq_ignore_ascii_case(b"pragma_"))
 }
 
 impl Connection {
-    /// Works around a turso 0.7.2 bug that silently discards writes.
-    ///
-    /// A pragma table-valued function (`SELECT ... FROM pragma_table_list`, as
-    /// opposed to the `PRAGMA table_list` statement form) is implemented by
-    /// `PragmaVirtualTableCursor`, which prepares an inner helper statement via
-    /// `Connection::prepare_internal`. Helper statements carry a "nested"
-    /// guard, and `Connection::is_nested_stmt()` is what the VDBE consults to
-    /// decide whether a statement owns transaction finalization. That guard is
-    /// never released for the pragma cursor, so the connection stays
-    /// permanently marked as nested and every subsequent statement skips its
-    /// commit: writes report success, are visible to the rest of the session,
-    /// and are gone once it closes. turso_core carries the identical fix for
-    /// two sibling paths (see the `take_parse_schema_if_active` and
-    /// `cleanup_vacuum_state` cleanup in `vdbe/mod.rs`) — the pragma cursor was
-    /// missed.
-    ///
-    /// An explicit `BEGIN`/`COMMIT` pair clears the leaked guard, so run one
-    /// after any statement that used a pragma TVF. Inside a caller's own
-    /// explicit transaction the bug does not bite (the outer `COMMIT` commits
-    /// normally) and `BEGIN` would fail with "cannot start a transaction
-    /// within a transaction" — so a failed `BEGIN` is the signal to do nothing,
-    /// not an error to propagate.
-    ///
-    /// Remove once turso releases the upstream fix.
-    fn repair_pragma_tvf_wedge(&self, conn: &turso::Connection) {
-        self.rt.block_on(async {
-            if conn.execute("BEGIN", ()).await.is_ok() {
-                let _ = conn.execute("COMMIT", ()).await;
-            }
-        });
-    }
-
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
         let result = self.rt.block_on(async {
             conn.execute(sql, tparams)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))
+                .map_err(|e| Error::from_engine(Error::Query, e))
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -307,6 +328,7 @@ impl Connection {
     /// names — needed by callers (e.g. an ActiveRecord adapter) that must
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
@@ -314,26 +336,37 @@ impl Connection {
             let mut rows = conn
                 .query(sql, tparams)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?;
-            // turso::Rows::column_names() reads column metadata off the
-            // prepared statement, so it's available up front (no need to
-            // step first) and stays fixed across the whole result set.
-            let columns = rows.column_names();
+                .map_err(|e| Error::from_engine(Error::Query, e))?;
+            // turso::Rows::columns() reads metadata off the prepared statement,
+            // so it's available before stepping and fixed for the result set.
+            let cols = rows.columns();
+            let columns = cols.iter().map(|c| c.name().to_string()).collect();
+            let decl_types = cols
+                .iter()
+                .map(|c| c.decl_type().map(str::to_string))
+                .collect();
             let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(|e| Error::Query(e.to_string()))? {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| Error::from_engine(Error::Query, e))?
+            {
                 let n = row.column_count();
                 let mut vals = Vec::with_capacity(n);
                 for i in 0..n {
-                    let cv = row.get_value(i).map_err(|e| Error::Query(e.to_string()))?;
+                    let cv = row
+                        .get_value(i)
+                        .map_err(|e| Error::from_engine(Error::Query, e))?;
                     vals.push(Value::from_turso(cv));
                 }
                 out.push(Row { values: vals });
             }
-            Ok(QueryResult { columns, rows: out })
+            Ok(QueryResult {
+                columns,
+                decl_types,
+                rows: out,
+            })
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -345,6 +378,7 @@ impl Connection {
     /// method's signature for API consistency with the rest of `Connection`,
     /// even though the underlying call cannot fail.
     pub fn last_insert_rowid(&self) -> Result<i64> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         Ok(conn.last_insert_rowid())
@@ -358,16 +392,14 @@ impl Connection {
     /// `;` — so statements containing `;` inside string literals (e.g.
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        check_pid(self.pid)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let result = self.rt.block_on(async {
             conn.execute_batch(sql)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))
+                .map_err(|e| Error::from_engine(Error::Query, e))
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -376,9 +408,23 @@ impl Connection {
     /// execution methods return [`Error::Closed`].
     ///
     /// As with [`Database::close`], the drop happens inside `rt.block_on` only
-    /// as a harmless defensive wrapper — turso 0.7.2's `Connection` has no
+    /// as a harmless defensive wrapper — turso 0.8.3's `Connection` has no
     /// custom `Drop` that awaits, so this resolves immediately.
     pub fn close(&self) {
+        if check_pid(self.pid).is_err() {
+            // Forked child: dropping the engine could block on the parent's
+            // worker thread. Leak it; the child's exit reclaims the memory.
+            // `try_lock`, because a parent thread may have held the mutex at
+            // fork time, leaving it locked with no owner in the child.
+            match self.conn.try_lock() {
+                Ok(mut g) => std::mem::forget(g.take()),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    std::mem::forget(p.into_inner().take())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            return;
+        }
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner()).take();
         if conn.is_some() {
             self.rt.block_on(async move { drop(conn) });
@@ -387,6 +433,14 @@ impl Connection {
 
     /// Whether this connection has been closed (see [`Connection::close`]).
     pub fn is_closed(&self) -> bool {
+        if check_pid(self.pid).is_err() {
+            // Forked child: see `Database::is_closed`.
+            return match self.conn.try_lock() {
+                Ok(g) => g.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            };
+        }
         self.conn
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -395,10 +449,112 @@ impl Connection {
 }
 
 impl Drop for Connection {
-    /// Backstop mirroring [`Database`]'s: dropping a `Connection` without an
-    /// explicit [`Connection::close`] still releases the handle uniformly.
-    /// Idempotent with a prior close.
+    /// Mirrors [`Database`]'s `Drop`, including the forked-child leak.
     fn drop(&mut self) {
+        if check_pid(self.pid).is_err() {
+            let slot = self.conn.get_mut().unwrap_or_else(|p| p.into_inner());
+            std::mem::forget(slot.take());
+            return;
+        }
         self.close();
+        // SAFETY: `rt` is never used again after this point.
+        unsafe { ManuallyDrop::drop(&mut self.rt) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fork_lock_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Fork while another thread holds `lock_it`'s mutex, then run `child_body`
+    /// in the child under a 5s alarm. Before the fix the child's `lock()` waited
+    /// forever on a futex with no owner, and SIGALRM killed it.
+    fn fork_with_lock_held(
+        lock_it: impl FnOnce(mpsc::Sender<()>, mpsc::Receiver<()>) + Send + 'static,
+        child_body: impl FnOnce(),
+    ) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || lock_it(held_tx, release_rx));
+        held_rx.recv().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::alarm(5) };
+            child_body();
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(waited, pid, "waitpid returned the wrong pid");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally (hung on a held lock?): {status}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn forked_child_does_not_hang_on_database_lock_held_at_fork() {
+        let db = Box::new(Database::open(OpenOptions::default()).unwrap());
+        let addr = &*db as *const Database as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `db`.
+                let db = unsafe { &*(addr as *const Database) };
+                let _guard = db.inner.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || {
+                db.close();
+                // Inherited handle is unusable in a child: reported closed.
+                assert!(db.is_closed());
+                std::mem::drop(db);
+            },
+        );
+    }
+
+    #[test]
+    fn forked_child_does_not_hang_on_connection_lock_held_at_fork() {
+        let db = Database::open(OpenOptions::default()).unwrap();
+        let conn = Box::new(db.connect().unwrap());
+        let addr = &*conn as *const Connection as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `conn`.
+                let conn = unsafe { &*(addr as *const Connection) };
+                let _guard = conn.conn.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || {
+                conn.close();
+                assert!(conn.is_closed());
+                std::mem::drop(conn);
+                std::mem::drop(db);
+            },
+        );
+    }
+
+    #[test]
+    fn forked_child_drop_without_close_does_not_hang_on_held_lock() {
+        let db = Box::new(Database::open(OpenOptions::default()).unwrap());
+        let addr = &*db as *const Database as usize;
+        fork_with_lock_held(
+            move |held, release| {
+                // SAFETY: the parent joins this thread before dropping `db`.
+                let db = unsafe { &*(addr as *const Database) };
+                let _guard = db.inner.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = release.recv();
+            },
+            || std::mem::drop(db),
+        );
     }
 }

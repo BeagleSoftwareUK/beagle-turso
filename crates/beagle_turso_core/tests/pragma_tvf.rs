@@ -3,8 +3,9 @@
 //! Querying a pragma TVF (`SELECT ... FROM pragma_table_list`) leaves the
 //! connection permanently marked as executing a nested statement, so every
 //! later statement skips its commit — writes report success and are visible
-//! for the rest of the session, then vanish when it closes. The driver repairs
-//! this with a BEGIN/COMMIT pair; see `Connection::repair_pragma_tvf_wedge`.
+//! for the rest of the session, then vanish when it closes. Fixed upstream in
+//! turso 0.8.3, which let us drop the driver's BEGIN/COMMIT workaround; these
+//! tests guard against the bug returning.
 use beagle_turso_core::{Database, OpenOptions, Value};
 
 fn scratch(name: &str) -> String {

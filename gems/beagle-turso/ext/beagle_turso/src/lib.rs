@@ -14,7 +14,17 @@
 // identical; the code is simpler and compiles with zero deprecation
 // warnings.
 
+// GVL: open_local, open, connect, push and pull (the calls that can wait on the
+// network or disk for a long time) run via nogvl::without_gvl with the GVL
+// released. Queries/execute stay under the GVL: they are short, local, and
+// release/reacquire would cost more than it saves.
+
+mod errors;
+mod nogvl;
+
 use beagle_turso_core::{Connection, Database, OpenOptions, Value};
+use errors::raise_core;
+use nogvl::without_gvl;
 use magnus::{
     encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
@@ -28,10 +38,6 @@ struct RbDatabase {
 #[magnus::wrap(class = "Beagle::Turso::Connection", free_immediately)]
 struct RbConnection {
     inner: Connection,
-}
-
-fn rt_err(ruby: &Ruby, msg: String) -> Error {
-    Error::new(ruby.exception_runtime_error(), msg)
 }
 
 fn ruby_array_to_params(ruby: &Ruby, arr: RArray) -> Result<Vec<Value>, Error> {
@@ -92,7 +98,7 @@ impl RbDatabase {
             auth_token: None,
             bootstrap_if_empty: true,
         };
-        let db = Database::open(opts).map_err(|e| rt_err(ruby, e.to_string()))?;
+        let db = without_gvl(|| Database::open(opts))?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
@@ -113,30 +119,24 @@ impl RbDatabase {
             auth_token,
             bootstrap_if_empty,
         };
-        let db = Database::open(opts).map_err(|e| rt_err(ruby, e.to_string()))?;
+        let db = without_gvl(|| Database::open(opts))?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbDatabase { inner: db })
     }
 
     fn connect(ruby: &Ruby, rb_self: &Self) -> Result<RbConnection, Error> {
-        let c = rb_self
-            .inner
-            .connect()
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
+        let inner = &rb_self.inner;
+        let c = without_gvl(|| inner.connect())?.map_err(|e| raise_core(ruby, e))?;
         Ok(RbConnection { inner: c })
     }
 
     fn push(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        rb_self
-            .inner
-            .push()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+        let inner = &rb_self.inner;
+        without_gvl(|| inner.push())?.map_err(|e| raise_core(ruby, e))
     }
 
     fn pull(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        rb_self
-            .inner
-            .pull()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+        let inner = &rb_self.inner;
+        without_gvl(|| inner.pull())?.map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying engine handle and, for a synced database, end its
@@ -151,13 +151,25 @@ impl RbDatabase {
     }
 }
 
+fn rows_to_ruby(ruby: &Ruby, rows: Vec<beagle_turso_core::Row>) -> Result<RArray, Error> {
+    let out = ruby.ary_new();
+    for row in rows {
+        let rb_row = ruby.ary_new();
+        for val in &row.values {
+            rb_row.push(value_to_ruby(ruby, val))?;
+        }
+        out.push(rb_row)?;
+    }
+    Ok(out)
+}
+
 impl RbConnection {
     fn execute(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<u64, Error> {
         let p = ruby_array_to_params(ruby, params)?;
         rb_self
             .inner
             .execute(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn query(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<RArray, Error> {
@@ -165,16 +177,8 @@ impl RbConnection {
         let rows = rb_self
             .inner
             .query(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
-        let out = ruby.ary_new();
-        for row in rows {
-            let rb_row = ruby.ary_new();
-            for val in &row.values {
-                rb_row.push(value_to_ruby(ruby, val))?;
-            }
-            out.push(rb_row)?;
-        }
-        Ok(out)
+            .map_err(|e| raise_core(ruby, e))?;
+        rows_to_ruby(ruby, rows)
     }
 
     // Like `query`, but also returns column names — needed by callers (e.g.
@@ -191,22 +195,44 @@ impl RbConnection {
         let result = rb_self
             .inner
             .query_result(&sql, &p)
-            .map_err(|e| rt_err(ruby, e.to_string()))?;
+            .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in &result.columns {
             columns.push(name.clone().into_value_with(ruby))?;
         }
-        let rows = ruby.ary_new();
-        for row in result.rows {
-            let rb_row = ruby.ary_new();
-            for val in &row.values {
-                rb_row.push(value_to_ruby(ruby, val))?;
-            }
-            rows.push(rb_row)?;
-        }
+        let rows = rows_to_ruby(ruby, result.rows)?;
         let out = ruby.ary_new();
         out.push(columns)?;
         out.push(rows)?;
+        Ok(out)
+    }
+
+    // Like `query_result`, plus each column's declared type (String or nil),
+    // which a Sequel adapter needs to pick value conversions. Returns
+    // `[columns, decl_types, rows]`.
+    fn query_result_with_types(
+        ruby: &Ruby,
+        rb_self: &Self,
+        sql: String,
+        params: RArray,
+    ) -> Result<RArray, Error> {
+        let p = ruby_array_to_params(ruby, params)?;
+        let result = rb_self
+            .inner
+            .query_result(&sql, &p)
+            .map_err(|e| raise_core(ruby, e))?;
+        let columns = ruby.ary_new();
+        for name in result.columns {
+            columns.push(name)?;
+        }
+        let types = ruby.ary_new();
+        for t in result.decl_types {
+            types.push(t)?; // Option<String> -> String or nil
+        }
+        let out = ruby.ary_new();
+        out.push(columns)?;
+        out.push(types)?;
+        out.push(rows_to_ruby(ruby, result.rows)?)?;
         Ok(out)
     }
 
@@ -214,14 +240,14 @@ impl RbConnection {
         rb_self
             .inner
             .last_insert_rowid()
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn execute_batch(ruby: &Ruby, rb_self: &Self, sql: String) -> Result<(), Error> {
         rb_self
             .inner
             .execute_batch(&sql)
-            .map_err(|e| rt_err(ruby, e.to_string()))
+            .map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying connection handle instead of waiting for GC.
@@ -253,6 +279,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     conn.define_method("execute", method!(RbConnection::execute, 2))?;
     conn.define_method("query", method!(RbConnection::query, 2))?;
     conn.define_method("query_result", method!(RbConnection::query_result, 2))?;
+    conn.define_method(
+        "query_result_with_types",
+        method!(RbConnection::query_result_with_types, 2),
+    )?;
     conn.define_method(
         "last_insert_rowid",
         method!(RbConnection::last_insert_rowid, 0),

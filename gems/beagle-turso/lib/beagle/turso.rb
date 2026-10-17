@@ -1,4 +1,5 @@
 require_relative "turso/version"
+require_relative "turso/errors"
 
 # Load the native extension. Precompiled ("fat") gems ship the .so under a
 # per-Ruby-ABI subdir (lib/beagle_turso/<major.minor>/beagle_turso.so); a
