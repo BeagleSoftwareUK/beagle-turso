@@ -1,0 +1,30 @@
+#!/usr/bin/env ruby
+# Runs Sequel's own integration suite (spec/integration) against this adapter.
+# Known engine gaps are listed, with reasons, in
+# spec/integration_known_failures.txt and excluded by exact test name.
+require "tmpdir"
+
+here = File.expand_path("..", __dir__)
+Dir.chdir(here)
+version = `bundle exec ruby -e 'require "sequel"; print Sequel::VERSION'`
+abort "could not determine the Sequel version" unless $?.success? && !version.empty?
+
+checkout = File.join(here, "tmp", "sequel-#{version}")
+unless Dir.exist?(checkout)
+  system("git", "clone", "--quiet", "--depth", "1", "--branch", version,
+         "https://github.com/jeremyevans/sequel", checkout, exception: true)
+end
+
+names = File.readlines(File.join(here, "spec", "integration_known_failures.txt"), chomp: true)
+  .map(&:strip).reject { |l| l.empty? || l.start_with?("#") }
+  .map { |l| l.split("|", 2).first.strip }
+exclude = names.empty? ? [] : ["--exclude", "/\\A(?:#{names.map { |n| Regexp.escape(n) }.join("|")})\\z/"]
+
+db = File.join(Dir.tmpdir, "sequel-integration-#{Process.pid}.db")
+env = { "SEQUEL_INTEGRATION_URL" => "beagle-turso://#{db}", "BUNDLE_GEMFILE" => File.join(here, "Gemfile") }
+ok = Dir.chdir(checkout) do
+  system(env, "bundle", "exec", "ruby", "-I", File.join(here, "lib"),
+         "spec/adapter_spec.rb", "none", *exclude, *ARGV)
+end
+Dir.glob("#{db}*").each { |f| File.delete(f) }
+exit(ok ? 0 : 1)
