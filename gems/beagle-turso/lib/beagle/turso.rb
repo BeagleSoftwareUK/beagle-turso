@@ -1,5 +1,6 @@
 require_relative "turso/version"
 require_relative "turso/errors"
+require_relative "turso/redaction"
 
 # Load the native extension. Precompiled ("fat") gems ship the .so under a
 # per-Ruby-ABI subdir (lib/beagle_turso/<major.minor>/beagle_turso.so); a
@@ -17,12 +18,28 @@ module Beagle
       # Opens a local-only database, or one synced with a remote Turso
       # database when both `remote_url` and `auth_token` are given (see
       # `#push`/`#pull`). Delegates to the native `_open` primitive, which
-      # takes its arguments positionally.
+      # takes its arguments positionally. Only the remote host is kept on
+      # the Ruby object; the token is never stored.
       def self.open(local_path:, remote_url: nil, auth_token: nil, bootstrap_if_empty: true)
-        _open(local_path, remote_url, auth_token, bootstrap_if_empty)
+        db = _open(local_path, remote_url, auth_token, bootstrap_if_empty)
+        if remote_url && auth_token
+          db.instance_variable_set(:@synced, true)
+          db.instance_variable_set(:@remote_host, Redaction.host(remote_url))
+        end
+        db
       end
 
       private_class_method :_open
+
+      # True when opened with both remote_url: and auth_token:, i.e. when
+      # #push/#pull talk to a remote.
+      def synced?
+        @synced == true
+      end
+
+      # The remote database's host, without scheme, path, query or
+      # credentials; nil for a local-only database.
+      attr_reader :remote_host
     end
   end
 end
