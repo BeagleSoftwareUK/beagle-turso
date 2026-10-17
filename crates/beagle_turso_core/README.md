@@ -40,7 +40,7 @@ assert_eq!(rows[0].values[0], Value::Text("x".into()));
 
 - `OpenOptions`'s `Debug` implementation redacts `auth_token` — credentials
   are never written to logs.
-- Pinned to `turso = "=0.7.2"` (a pre-1.0 crate); the version is held exact
+- Pinned to `turso = "=0.8.3"` (a pre-1.0 crate); the version is held exact
   until its API stabilizes.
 - The synced round-trip test (`tests/sync.rs`) needs `TURSO_DATABASE_URL` /
   `TURSO_AUTH_TOKEN` and SKIPs when they're absent (e.g. in CI).

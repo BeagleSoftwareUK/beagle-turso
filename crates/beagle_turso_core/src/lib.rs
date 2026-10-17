@@ -202,13 +202,13 @@ impl Database {
     /// Idempotent. After close, [`Database::connect`]/[`Database::push`]/
     /// [`Database::pull`] return [`Error::Closed`].
     ///
-    /// The `turso` crate (v0.7.2) exposes no explicit async `close`/`shutdown`
+    /// The `turso` crate (v0.8.3) exposes no explicit async `close`/`shutdown`
     /// on `sync::Database`/`Connection`; teardown is via `Drop`. A synced
     /// `turso::sync::Database` runs its IO on an independent worker thread that
     /// holds only a `Weak` reference to the sync engine; dropping the last
     /// strong handle (our `Inner`) closes the worker's mpsc channel and lets
     /// its `Weak::upgrade` fail, so the worker loop exits and the sync engine
-    /// is released — that is what ends the server-side session. turso 0.7.2 has
+    /// is released — that is what ends the server-side session. turso 0.8.3 has
     /// no custom `Drop` that touches the *current* runtime, so the
     /// `block_on(async move { drop(inner) })` below has no await and resolves
     /// immediately; it is kept purely as a harmless defensive wrapper (a live
@@ -238,52 +238,7 @@ impl Drop for Database {
     }
 }
 
-/// Does this SQL reference a pragma table-valued function (`pragma_table_list`,
-/// `pragma_table_info`, `pragma_database_list`, ...)?
-///
-/// Deliberately a cheap substring test rather than a parse: a false positive
-/// (a user table or string literal containing `pragma_`) only costs one empty
-/// BEGIN/COMMIT pair, whereas a false negative silently loses writes. See
-/// [`Connection::repair_pragma_tvf_wedge`].
-fn uses_pragma_tvf(sql: &str) -> bool {
-    sql.as_bytes()
-        .windows(7)
-        .any(|w| w.eq_ignore_ascii_case(b"pragma_"))
-}
-
 impl Connection {
-    /// Works around a turso 0.7.2 bug that silently discards writes.
-    ///
-    /// A pragma table-valued function (`SELECT ... FROM pragma_table_list`, as
-    /// opposed to the `PRAGMA table_list` statement form) is implemented by
-    /// `PragmaVirtualTableCursor`, which prepares an inner helper statement via
-    /// `Connection::prepare_internal`. Helper statements carry a "nested"
-    /// guard, and `Connection::is_nested_stmt()` is what the VDBE consults to
-    /// decide whether a statement owns transaction finalization. That guard is
-    /// never released for the pragma cursor, so the connection stays
-    /// permanently marked as nested and every subsequent statement skips its
-    /// commit: writes report success, are visible to the rest of the session,
-    /// and are gone once it closes. turso_core carries the identical fix for
-    /// two sibling paths (see the `take_parse_schema_if_active` and
-    /// `cleanup_vacuum_state` cleanup in `vdbe/mod.rs`) — the pragma cursor was
-    /// missed.
-    ///
-    /// An explicit `BEGIN`/`COMMIT` pair clears the leaked guard, so run one
-    /// after any statement that used a pragma TVF. Inside a caller's own
-    /// explicit transaction the bug does not bite (the outer `COMMIT` commits
-    /// normally) and `BEGIN` would fail with "cannot start a transaction
-    /// within a transaction" — so a failed `BEGIN` is the signal to do nothing,
-    /// not an error to propagate.
-    ///
-    /// Remove once turso releases the upstream fix.
-    fn repair_pragma_tvf_wedge(&self, conn: &turso::Connection) {
-        self.rt.block_on(async {
-            if conn.execute("BEGIN", ()).await.is_ok() {
-                let _ = conn.execute("COMMIT", ()).await;
-            }
-        });
-    }
-
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
@@ -293,9 +248,6 @@ impl Connection {
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -331,9 +283,6 @@ impl Connection {
             }
             Ok(QueryResult { columns, rows: out })
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -365,9 +314,6 @@ impl Connection {
                 .await
                 .map_err(|e| Error::Query(e.to_string()))
         });
-        if uses_pragma_tvf(sql) {
-            self.repair_pragma_tvf_wedge(conn);
-        }
         result
     }
 
@@ -376,7 +322,7 @@ impl Connection {
     /// execution methods return [`Error::Closed`].
     ///
     /// As with [`Database::close`], the drop happens inside `rt.block_on` only
-    /// as a harmless defensive wrapper — turso 0.7.2's `Connection` has no
+    /// as a harmless defensive wrapper — turso 0.8.3's `Connection` has no
     /// custom `Drop` that awaits, so this resolves immediately.
     pub fn close(&self) {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner()).take();
