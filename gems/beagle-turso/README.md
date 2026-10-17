@@ -152,6 +152,55 @@ still a `RuntimeError`. A replica file already held by another process raises
   `closed?` is safe (it reports the handle as closed if it can't be inspected),
   so inherited handles need no cleanup in the child.
 
+## Background sync
+
+`Beagle::Turso::Syncer` keeps the remote copy current without a job system:
+
+```ruby
+db = Beagle::Turso::Database.open(local_path: "app.db", remote_url: url, auth_token: token)
+
+syncer = Beagle::Turso::Syncer.new(
+  db,
+  interval: 30,        # seconds between cycles
+  pull: true,          # pull after each push (false = push only)
+  max_backoff: 300,    # retry delay cap, seconds
+  on_error: ->(error, status) { ErrorTracker.notify(error) },
+  logger: Logger.new($stderr),
+).start
+
+syncer.status   # => #<data Status running=true, syncing=false, last_push_at=..., ...>
+syncer.sync_now # one cycle now, on this thread; :ok, or :busy if one is running
+
+# on shutdown, before closing the database:
+syncer.stop(timeout: 10)   # waits for an in-flight sync, then pushes once more
+db.close
+```
+
+- **Opt-in.** Requiring the gem starts nothing. `start` runs one background
+  thread. `push` and `pull` release the GVL, so that thread doesn't hold up
+  requests on other threads or a Falcon reactor.
+- **Failures don't stop it.** Each failure is logged (at `warn`) and passed to
+  `on_error`. The next attempt waits `interval × 2ⁿ`, capped at
+  `max_backoff`, with ±20% jitter. A success resets the count. A failed push
+  skips that cycle's pull.
+- **Status is for monitoring, not lag.** `last_push_at` says when a push last
+  succeeded, not how much is still unpushed. Alert when `consecutive_failures`
+  grows, or when `last_push_at` gets older than you can tolerate. The site keeps
+  serving from the local replica either way. `destination` is the remote host
+  only, and error messages are stripped of URLs and tokens.
+- **Shutdown is best-effort.** `stop` waits up to `timeout` in total. A push or
+  pull already in flight can't be interrupted, so if the deadline passes, `stop`
+  returns with `status.syncing == true` and the work finishes in the background.
+  `stop(timeout: 0)` skips the final push, and so does a cycle already running
+  on another thread at that moment (e.g. a concurrent `sync_now`), so call
+  `stop` before other shutdown work that might sync.
+  If the network is down, the deadline passes, or the process is killed, writes
+  stay local until the next process pushes them. `stop` never closes the
+  database; do that after it returns.
+- **One syncer per process, created after fork.** A stopped syncer can't be
+  restarted, so create a new one. In a forking server, create it in the child,
+  for example in Puma's `on_worker_boot`.
+
 ## Credential safety
 
 `auth_token` is never included in `inspect` output or in error messages —
