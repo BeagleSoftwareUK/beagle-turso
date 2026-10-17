@@ -98,6 +98,9 @@ module Sequel
 
       # The driver prefixes engine messages ("query failed: ..."); Sequel's
       # SQLite error regexps (some anchored at \A) expect the bare message.
+      # Tables the Turso sync engine creates on a synced replica; never user tables.
+      SYNC_ENGINE_TABLES = %w[turso_cdc turso_cdc_version turso_sync_last_change_id].freeze
+
       ENGINE_PREFIX = /\A(?:open failed|connect failed|query failed|sync failed|database is busy): /
 
       set_adapter_scheme :beagle_turso
@@ -453,7 +456,10 @@ module Sequel
 
       # AUTOINCREMENT tables get engine bookkeeping tables in sqlite_master.
       def tables_and_views(filter, opts)
-        super.reject { |name| name.to_s.start_with?("__turso_internal_") }
+        super.reject do |name|
+          name = name.to_s
+          name.start_with?("__turso_internal_") || SYNC_ENGINE_TABLES.include?(name)
+        end
       end
 
       def support_without_rowid?

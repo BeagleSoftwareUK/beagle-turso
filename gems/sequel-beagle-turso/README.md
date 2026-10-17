@@ -131,6 +131,9 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
 
 ## Limitations
 
+- The sync engine's own tables (`turso_cdc`, `turso_cdc_version`,
+  `turso_sync_last_change_id`) are hidden from `tables` and `views`, so cleaners
+  and schema dumpers can't truncate the change log.
 - The engine doesn't support generated columns, `WITHOUT ROWID` tables, fts5 or
   `ATTACH`.
 - Declared-type arguments (`varchar(255)`, `numeric(12,0)`) aren't reported by

@@ -26,6 +26,48 @@ RSpec.describe "Sequel::BeagleTurso schema handling" do
     expect(db.tables.any? { |t| t.to_s.start_with?("__turso_internal_") }).to be(false)
   end
 
+  it "hides the sync engine's tables by exact name, not by prefix" do
+    reserved = %i[turso_cdc turso_cdc_version turso_sync_last_change_id]
+    created = []
+    (reserved + %i[turso_sync_log normal]).each do |name|
+      begin
+        db.create_table(name) { primary_key :id }
+        created << name
+      rescue Sequel::DatabaseError => e
+        warn "engine refused table #{name}: #{e.message}"
+      end
+    end
+    expect(created).to include(:turso_sync_log, :normal)
+    expect(db.tables).to include(:turso_sync_log, :normal)
+    expect(db.tables & reserved).to be_empty
+    expect(db.views).not_to include(*reserved)
+  end
+
+  describe "on a synced replica" do
+    let(:url) { ENV["TURSO_DATABASE_URL"] }
+    let(:token) { ENV["TURSO_AUTH_TOKEN"] }
+    before { skip "no TURSO creds" if url.to_s.empty? || token.to_s.empty? }
+
+    it "does not list the sync engine's tables" do
+      synced = Sequel.connect("beagle-turso://#{tmp_db}", remote_url: url, auth_token: token)
+      begin
+        synced.create_table(:sbt_synctables_probe) { primary_key :id }
+        synced.turso_database.push
+        names = synced.tables.map(&:to_s)
+        expect(names).to include("sbt_synctables_probe")
+        expect(names.grep(/\Aturso_cdc/)).to be_empty
+        expect(names.include?("turso_sync_last_change_id")).to be(false)
+      ensure
+        begin
+          synced.drop_table?(:sbt_synctables_probe)
+          synced.turso_database.push
+        ensure
+          synced.close_replica
+        end
+      end
+    end
+  end
+
   it "parses schema and indexes" do
     db.create_table(:s) { primary_key :id; String :name, null: false; index :name, unique: true }
     sch = db.schema(:s).to_h
