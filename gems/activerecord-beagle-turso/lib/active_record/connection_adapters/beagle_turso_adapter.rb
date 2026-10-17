@@ -219,8 +219,21 @@ module ActiveRecord
         # `create_table "__turso_internal_seq_..."` block per table into
         # db/schema.rb, and the next `db:schema:load` tries to create them for
         # real.
+        #
+        # On a synced replica the sync engine also keeps its change log in
+        # three tables (`turso_cdc`, `turso_cdc_version`,
+        # `turso_sync_last_change_id`). They are matched by EXACT name so a user
+        # table such as `turso_sync_log` stays visible. Left unfiltered,
+        # `db:schema:dump` would dump them and `db:truncate_all`, fixtures or
+        # DatabaseCleaner truncation would wipe the change log (losing unpushed
+        # sync data).
+        SYNC_ENGINE_TABLES = %w[turso_cdc turso_cdc_version turso_sync_last_change_id].freeze
+        private_constant :SYNC_ENGINE_TABLES
+
         def data_source_sql(name = nil, type: nil)
-          "#{super} AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'"
+          hidden = SYNC_ENGINE_TABLES.map { |t| quote(t) }.join(", ")
+          "#{super} AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'" \
+            " AND name NOT IN (#{hidden})"
         end
 
         # A column definition in the DDL that carries a parenthesised type
