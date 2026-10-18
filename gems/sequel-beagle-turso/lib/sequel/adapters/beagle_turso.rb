@@ -536,11 +536,36 @@ module Sequel
             ocp = lambda { |oc| oc.delete_if { |c| c.to_s == op[:name].to_s } }
             return duplicate_table(table, old_columns_proc: ocp) { |cols| cols.delete_if { |s| s[:name].to_s == op[:name].to_s } }
           when :rename_column
-            ncp = lambda { |nc| nc.map! { |c| c.to_s == op[:name].to_s ? op[:new_name] : c } }
-            return duplicate_table(table, new_columns_proc: ncp) { |cols| cols.each { |s| s[:name] = op[:new_name] if s[:name].to_s == op[:name].to_s } }
+            return rebuild_renaming_column(table, op)
           end
         end
         super
+      end
+
+      # Column rename as a rebuild. Sequel's fallback renames the column first
+      # and then looks up UNIQUE constraints and indexes by the old name, so it
+      # loses them. Take them before the rebuild and replay them with the new
+      # name: inline/composite UNIQUE (autoindexes) become column or table
+      # constraints, every other index mentioning the column is recreated.
+      def rebuild_renaming_column(table, op)
+        old = op[:name].to_s
+        new = op[:new_name]
+        rn = ->(cols) { cols.map { |c| c.to_s == old ? new : c } }
+        pks = schema(table).select { |_, c| c[:primary_key] }.map { |n, _| n.to_s }
+        auto_all = indexes(table, only_autocreated: true)
+        auto = auto_all.values.select { |h| h[:unique] && h[:columns].map(&:to_s) != pks }
+        single = auto.select { |h| h[:columns].length == 1 }.map { |h| rn.(h[:columns]).first.to_s }
+        constraints = auto.select { |h| h[:columns].length > 1 }.map { |h| { type: :unique, columns: rn.(h[:columns]) } }
+        named = indexes(table).select { |n, h| !auto_all.key?(n) && h[:columns].map(&:to_s).include?(old) }
+
+        ncp = ->(nc) { nc.map! { |c| c.to_s == old ? new : c } }
+        sqls = duplicate_table(table, new_columns_proc: ncp, no_unique: true, constraints: constraints) do |cols|
+          cols.each do |c|
+            c[:name] = new if c[:name].to_s == old
+            c[:unique] = true if single.include?(c[:name].to_s) && !c[:primary_key]
+          end
+        end
+        sqls + named.map { |name, h| alter_table_sql(table, h.merge(op: :add_index, name: name, columns: rn.(h[:columns]))) }
       end
 
       def support_without_rowid?

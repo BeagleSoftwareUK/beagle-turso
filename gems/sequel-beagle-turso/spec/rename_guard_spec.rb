@@ -65,6 +65,41 @@ RSpec.describe "renames on a synced replica" do
     expect(db.tables).to eq([:t])
   end
 
+  describe "rename_column keeps unique constraints and indexes when synced" do
+    before do
+      db.create_table(:p) do
+        primary_key :id
+        String :u, unique: true
+        Integer :n, index: true
+        String :m
+        String :v, index: { unique: true }
+        unique %i[m n]
+      end
+      db[:p].insert(u: "x", n: 1, m: "a", v: "k")
+      pretend_synced(db)
+    end
+
+    def shape(db)
+      db.indexes(:p).values.map { |i| [i[:columns], i[:unique]] }.sort_by(&:inspect)
+    end
+
+    it "matches what a native rename leaves, and still enforces uniqueness" do
+      before = shape(db)
+      sql = capture_sql(db) do
+        db.alter_table(:p) { rename_column :u, :u2 }
+        db.alter_table(:p) { rename_column :n, :n2 }
+        db.alter_table(:p) { rename_column :v, :v2 }
+      end
+      expect(sql).not_to match(/RENAME/i)
+      renamed = { u: :u2, n: :n2, v: :v2 }
+      expect(shape(db)).to eq(before.map { |cols, uniq| [cols.map { |c| renamed.fetch(c, c) }, uniq] }.sort_by(&:inspect))
+      expect(db[:p].all).to eq([{ id: 1, u2: "x", n2: 1, m: "a", v2: "k" }])
+      expect { db[:p].insert(u2: "x", n2: 5, m: "b", v2: "j") }.to raise_error(Sequel::UniqueConstraintViolation)
+      expect { db[:p].insert(u2: "y", n2: 5, m: "b", v2: "k") }.to raise_error(Sequel::UniqueConstraintViolation)
+      expect { db[:p].insert(u2: "y", n2: 1, m: "a", v2: "j") }.to raise_error(Sequel::UniqueConstraintViolation)
+    end
+  end
+
   it "rebuilds without RENAME on a local-only replica too" do
     db[:t].insert(name: "a")
     sql = capture_sql(db) { db.alter_table(:t) { set_column_allow_null :name, false } }
@@ -127,14 +162,18 @@ RSpec.describe "renames on a synced replica" do
         db[t].insert(name: "unpushed", n: 3)
         db.alter_table(t) { drop_column :n }
       },
-      "rename_column" => ->(db, t) { db.alter_table(t) { rename_column :name, :label } }
+      "rename_column" => ->(db, t) { db.alter_table(t) { rename_column :name, :label } },
+      "rename_column of unique and indexed columns" => lambda { |db, t|
+        db.alter_table(t) { rename_column :code, :code2 }
+        db.alter_table(t) { rename_column :n, :n2 }
+      }
     }.each do |label, op|
       it "converges the remote with local after #{label}" do
         t = :"sbt_rb_#{SecureRandom.hex(3)}"
         db = replica
         begin
-          db.create_table(t) { primary_key :id; String :name; Integer :n, index: true }
-          db[t].insert(name: "a", n: 1)
+          db.create_table(t) { primary_key :id; String :name; Integer :n, index: true; String :code, unique: true }
+          db[t].insert(name: "a", n: 1, code: "c1")
           db.turso_database.push
           op.(db, t)
           local = db[t].order(:id).all
@@ -145,6 +184,8 @@ RSpec.describe "renames on a synced replica" do
             fresh.turso_database.pull
             expect(fresh[t].order(:id).all).to eq(local)
             expect(fresh.schema(t, reload: true).map(&:first)).to eq(db.schema(t, reload: true).map(&:first))
+            shape = ->(d) { d.indexes(t).values.map { |i| [i[:columns], i[:unique]] }.sort_by(&:inspect) }
+            expect(shape.(fresh)).to eq(shape.(db))
             expect(fresh.tables.map(&:to_s).grep(/\A#{t}/)).to eq([t.to_s])
           ensure
             fresh.close_replica

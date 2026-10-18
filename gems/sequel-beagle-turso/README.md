@@ -181,7 +181,12 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
   `RENAME COLUMN` isn't synced). Rebuilds therefore copy the data twice, and
   **the first push after a rebuild on a synced replica raises a `SyncError`
   once; push again and the data converges** (`Syncer` logs it once and
-  retries).
+  retries). Rebuilds (Sequel's stock ones too) have these limits:
+  - triggers on the table are lost;
+  - the `AUTOINCREMENT` counter restarts from the current max id, so a deleted
+    top id can be reused;
+  - partial indexes are not recreated;
+  - a column's `COLLATE` is dropped.
 - **Insert return values.** `Dataset#insert` returns the last inserted row's
   rowid. An `ON CONFLICT DO UPDATE` upsert returns the updated row's rowid, and
   an insert that is ignored (`insert_ignore`, `ON CONFLICT DO NOTHING`) returns
