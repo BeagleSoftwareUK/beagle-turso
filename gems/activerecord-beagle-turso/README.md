@@ -63,6 +63,13 @@ some diagnostics, but these are custom `database.yml` keys, so that masking
 does not cover them automatically. Source them from encrypted credentials or
 `ENV`, as above, and avoid logging/inspecting the raw connection config.
 
+`timeout:` (milliseconds, as in the stock SQLite adapter; Rails' generated
+`database.yml` sets 5000) is how long a write waits for another connection's
+transaction to finish before raising `Beagle::Turso::BusyError`. Transactions
+begin with `BEGIN IMMEDIATE`, so a writer waits at `BEGIN`, never part-way
+through. The wait sleeps in Ruby, so other threads and fibers keep running.
+Without `timeout:` (or with 0), a busy write raises at once.
+
 An optional `bootstrap_if_empty:` (default `true`) controls whether a brand
 new/empty local file is populated from the remote on first open — see
 `Beagle::Turso::Database.open`.
