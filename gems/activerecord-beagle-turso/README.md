@@ -125,6 +125,14 @@ A recurring `SyncJob` against a local-only connection will fail every run
 with `NotSyncedError` — only add the recurring entry for environments whose
 `database.yml` connection actually carries `remote_url:`/`auth_token:`.
 
+## Synced replicas: what's guarded
+
+Three bugs in the Turso 0.8.3 sync engine affect a synced replica (`remote_url:` + `auth_token:`). This adapter guards against each. Local-only connections are unchanged.
+
+- **Renames are refused.** The engine does not capture `ALTER TABLE ... RENAME TO` or `RENAME COLUMN` for sync, so the remote keeps the old name and every later write to the table is lost on push. `rename_table`, `rename_column` (and `change_table { |t| t.rename }`), plus raw `ALTER TABLE ... RENAME` SQL, raise `ActiveRecord::ConnectionAdapters::BeagleTurso::UnsupportedOnSyncedReplica`. Instead, add a new table or column, copy the data, and drop the old one; or apply the rename directly on the remote and pull, with writes to that table paused. Not reported upstream as a fix yet; reported separately.
+- **Insert ids come from `RETURNING`.** On an MVCC replica with change capture (every synced replica of a `--tursodb` remote) the engine's `last_insert_rowid` returns an internal change id ([tursodatabase/turso#9551](https://github.com/tursodatabase/turso/issues/9551)). Model creates already use `INSERT ... RETURNING "id"`. For plain `INSERT`s (`connection.insert`, `exec_insert` on a table without a named primary key) the adapter now runs `INSERT ... RETURNING rowid` and reads the id from the result. Override with `insert_returning_rowid: true|false` in `database.yml`.
+- **Migrations push first and last.** Unpushed row writes to a table that is altered or dropped before the next push are skipped by the remote and then lost on pull (reported upstream separately). `db:migrate`, `db:migrate:up/down/redo`, `db:rollback`, `db:forward`, `db:prepare` and `db:schema:load` (which `db:setup` and `db:reset` use) push before and after. If the push before fails, the task aborts. If the push after fails, the task fails and tells you the schema change exists only locally. Set `BEAGLE_TURSO_SKIP_MIGRATION_PUSH=1` to skip both pushes with a warning. Only the primary database is guarded.
+
 ## Test coverage
 
 This gem's own spec suite (`spec/`, run via `bundle exec rspec`) is 35
