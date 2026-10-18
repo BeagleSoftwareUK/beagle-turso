@@ -74,12 +74,87 @@ module ActiveRecord
       INSERT_STATEMENT_REGEX = /\A\s*(?:(?:INSERT|REPLACE)\b|WITH\b[\s\S]*\)\s*(?:INSERT|REPLACE)\b)/i
       private_constant :INSERT_STATEMENT_REGEX
 
+      # A statement that lost the single-writer race. A stale snapshot is
+      # never retried: the transaction that read it has to start again.
+      STATEMENT_BUSY = lambda do |error|
+        error.is_a?(::Beagle::Turso::BusyError) && !error.message.include?("snapshot is stale")
+      end
+      private_constant :STATEMENT_BUSY
+
+      # Opening or connecting to a synced replica while another connection
+      # syncs it. The sync engine reports that as "database tape error:
+      # database is busy" inside an OpenError or ConnectError (the driver only
+      # classifies the engine's own "Database is busy" as BusyError).
+      OPEN_BUSY = lambda do |error|
+        STATEMENT_BUSY.call(error) ||
+          ((error.is_a?(::Beagle::Turso::OpenError) || error.is_a?(::Beagle::Turso::ConnectError)) &&
+            error.message.match?(/database is busy/i))
+      end
+      private_constant :OPEN_BUSY
+
       class << self
         # Open a beagle-turso Database (synced remote when +remote_url+ is
         # present, otherwise local/in-memory) and wrap it so the SQLite3Adapter
-        # can drive it as a raw connection.
+        # can drive it as a raw connection. A busy open is retried for
+        # database.yml's `timeout:`, like a busy statement.
         def new_client(config)
-          database =
+          busy = ->(error) { OPEN_BUSY.call(error) || torn_meta_read?(error, config) }
+          retry_busy(busy_timeout(config[:timeout]), busy: busy) do
+            database = open_database(config)
+            begin
+              Client.new(database)
+            rescue Exception
+              database.close
+              raise
+            end
+          end
+        end
+
+        # `timeout:` (ms, as in database.yml) as seconds; nil means no waiting.
+        def busy_timeout(milliseconds)
+          milliseconds.to_i.positive? ? milliseconds.to_i / 1000.0 : nil
+        end
+
+        # Retries the block while it raises an error +busy+ accepts, with
+        # capped exponential backoff, for up to +timeout+ seconds. The engine
+        # never waits for a lock itself (from beagle-turso 0.4.0 it raises at
+        # once), so this is where the wait happens. sleep releases the GVL and
+        # yields to a fiber scheduler, so whoever holds the lock can finish.
+        def retry_busy(timeout, busy:)
+          deadline = nil
+          delay = 0.002
+          begin
+            yield
+          rescue ::Beagle::Turso::Error => e
+            raise if timeout.nil? || !busy.call(e)
+
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            deadline ||= now + timeout
+            raise if now + delay > deadline
+
+            sleep delay
+            delay = [delay * 2, 0.1].min
+            retry
+          end
+        end
+
+        def synced_config?(config)
+          !config[:remote_url].to_s.empty? && !config[:auth_token].to_s.empty?
+        end
+
+        private
+          # The sync engine (turso 0.8.3) rewrites a replica's metadata file
+          # (`<database>-info`) in place, truncating it first, so an open that
+          # reads it mid-sync can find it empty and fail with "meta must be
+          # initialized before open". Retried only when the file is there: a
+          # replica that was never initialised fails at once.
+          def torn_meta_read?(error, config)
+            error.is_a?(::Beagle::Turso::OpenError) &&
+              error.message.include?("meta must be initialized before open") &&
+              File.exist?("#{config[:database]}-info")
+          end
+
+          def open_database(config)
             if config[:remote_url]
               Beagle::Turso::Database.open(
                 local_path: config[:database].to_s,
@@ -90,12 +165,7 @@ module ActiveRecord
             else
               Beagle::Turso::Database.open_local(config[:database].to_s)
             end
-          Client.new(database)
-        end
-
-        def synced_config?(config)
-          !config[:remote_url].to_s.empty? && !config[:auth_token].to_s.empty?
-        end
+          end
       end
 
       # Adapts a Beagle::Turso::Database + its connected Connection to the subset
@@ -187,31 +257,14 @@ module ActiveRecord
         # does to the sqlite3 gem's busy handler. Unset or 0 means no waiting:
         # a BusyError surfaces at once, as with the sqlite3 gem.
         def busy_handler_timeout=(milliseconds)
-          @busy_timeout = milliseconds.to_i.positive? ? milliseconds.to_i / 1000.0 : nil
+          @busy_timeout = BeagleTursoAdapter.busy_timeout(milliseconds)
         end
 
-        # Retries a statement that lost the single-writer race, with capped
-        # exponential backoff, for up to the busy timeout. The engine never
-        # waits for a lock itself (from beagle-turso 0.4.0 it raises at once),
-        # so this is where the wait happens. sleep releases the GVL and yields
-        # to a fiber scheduler, so the writer holding the lock can finish. The
-        # caller decides what is safe to retry (see BeagleTursoAdapter#perform_query).
-        def retry_busy
-          deadline = nil
-          delay = 0.002
-          begin
-            yield
-          rescue ::Beagle::Turso::BusyError => e
-            raise if @busy_timeout.nil? || e.message.include?("snapshot is stale")
-
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            deadline ||= now + @busy_timeout
-            raise if now + delay > deadline
-
-            sleep delay
-            delay = [delay * 2, 0.1].min
-            retry
-          end
+        # Retries a statement that lost the single-writer race for up to the
+        # busy timeout (see BeagleTursoAdapter.retry_busy). The caller decides
+        # what is safe to retry (see BeagleTursoAdapter#perform_query).
+        def retry_busy(&)
+          BeagleTursoAdapter.retry_busy(@busy_timeout, busy: STATEMENT_BUSY, &)
         end
 
         # --- sqlite3-gem lifecycle shims the SQLite3Adapter drives ---

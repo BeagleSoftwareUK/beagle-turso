@@ -122,4 +122,137 @@ RSpec.describe "beagle_turso busy retry" do
       expect(attempts).to eq(1)
     end
   end
+
+  # Opening a synced replica while another connection syncs it fails with
+  # "database tape error: database is busy", as an OpenError or ConnectError.
+  describe "opening a connection" do
+    let(:adapter) { ActiveRecord::ConnectionAdapters::BeagleTursoAdapter }
+    let(:tape_busy) { "sync engine operation failed: database tape error: database is busy" }
+
+    # Database stand-in whose connect fails with +errors+ in turn, then
+    # connects to a real in-memory database. Records whether it was closed.
+    def flaky_database(*errors)
+      real = Beagle::Turso::Database.open_local(":memory:")
+      Struct.new(:errors, :real, :closed) do
+        def connect = errors.empty? ? real.connect : raise(errors.shift)
+        def close = self.closed = true
+      end.new(errors, real, false)
+    end
+
+    it "retries an open that finds the replica busy" do
+      attempts = 0
+      allow(adapter).to receive(:open_database) do
+        attempts += 1
+        raise Beagle::Turso::OpenError, "open failed: #{tape_busy}" if attempts < 3
+        Beagle::Turso::Database.open_local(":memory:")
+      end
+
+      client = adapter.new_client(database: ":memory:", timeout: 1000)
+      expect(attempts).to eq(3)
+      expect(client.closed?).to be(false)
+      client.close
+    end
+
+    it "retries a busy connect, closing the database it opened" do
+      busy = flaky_database(Beagle::Turso::ConnectError.new("connect failed: #{tape_busy}"))
+      opened = [busy]
+      allow(adapter).to receive(:open_database) { opened.shift || Beagle::Turso::Database.open_local(":memory:") }
+
+      client = adapter.new_client(database: ":memory:", timeout: 1000)
+      expect(busy.closed).to be(true)
+      client.close
+    end
+
+    it "does not retry an open that fails for another reason" do
+      attempts = 0
+      allow(adapter).to receive(:open_database) do
+        attempts += 1
+        raise Beagle::Turso::OpenError, "open failed: File is locked by another process"
+      end
+
+      expect { adapter.new_client(database: ":memory:", timeout: 1000) }.to raise_error(Beagle::Turso::OpenError)
+      expect(attempts).to eq(1)
+    end
+
+    it "retries an open that read the replica's metadata mid-rewrite" do
+      File.write("#{@path}-info", "{}")
+      attempts = 0
+      allow(adapter).to receive(:open_database) do
+        attempts += 1
+        raise Beagle::Turso::OpenError, "open failed: database sync engine error: meta must be initialized before open" if attempts < 2
+        Beagle::Turso::Database.open_local(":memory:")
+      end
+
+      adapter.new_client(database: @path, timeout: 1000).close
+      expect(attempts).to eq(2)
+    end
+
+    it "does not retry missing metadata on a replica that was never initialised" do
+      attempts = 0
+      allow(adapter).to receive(:open_database) do
+        attempts += 1
+        raise Beagle::Turso::OpenError, "open failed: database sync engine error: meta must be initialized before open"
+      end
+
+      expect { adapter.new_client(database: @path, timeout: 1000) }.to raise_error(Beagle::Turso::OpenError, /meta must be initialized/)
+      expect(attempts).to eq(1)
+    end
+
+    it "raises a busy open at once without a timeout" do
+      attempts = 0
+      allow(adapter).to receive(:open_database) do
+        attempts += 1
+        raise Beagle::Turso::OpenError, "open failed: #{tape_busy}"
+      end
+
+      expect { adapter.new_client(database: ":memory:") }.to raise_error(Beagle::Turso::OpenError, /database is busy/)
+      expect(attempts).to eq(1)
+    end
+
+    # The failure old_bridge_inn's SyncJob hit: the pool opens connections
+    # to a synced replica while another connection writes and pushes.
+    it "opens connections to a synced replica while another pushes" do
+      url = ENV["TURSO_DATABASE_URL"]
+      token = ENV["TURSO_AUTH_TOKEN"]
+      skip "no TURSO creds (TURSO_DATABASE_URL/TURSO_AUTH_TOKEN unset)" if url.to_s.empty? || token.to_s.empty?
+
+      config = { database: @path, remote_url: url, auth_token: token, timeout: 5000 }
+      seed = adapter.new_client(config)
+      seed.busy_handler_timeout = 5000
+      seed.execute("CREATE TABLE IF NOT EXISTS open_busy_probe (x INTEGER)", [])
+      errors = Queue.new
+      push_errors = Queue.new
+      stop = false
+      pusher = Thread.new do
+        i = 0
+        until stop
+          seed.retry_busy { seed.execute("INSERT INTO open_busy_probe VALUES (?)", [i += 1]) }
+          begin; seed.push; rescue Beagle::Turso::Error => e; push_errors << "#{e.class}: #{e.message}"; end
+        end
+      end
+
+      openers = Array.new(6) do
+        Thread.new do
+          8.times do
+            client = adapter.new_client(config.merge(bootstrap_if_empty: false))
+            client.query_result("SELECT count(*) FROM open_busy_probe", [])
+            client.close
+          rescue Beagle::Turso::Error => e
+            errors << "#{e.class}: #{e.message}"
+          end
+        end
+      end
+      openers.each(&:join)
+      stop = true
+      pusher.join
+      seed.execute("DROP TABLE open_busy_probe", [])
+      seed.push
+      seed.close
+
+      all = Array.new(errors.size) { errors.pop }
+      warn "push errors: #{Array.new(push_errors.size) { push_errors.pop }.tally}" unless push_errors.empty?
+      warn all.tally.map { |k, v| "#{v} x #{k[0, 200]}" }.join("\n") unless all.empty?
+      expect(all).to eq([])
+    end
+  end
 end
