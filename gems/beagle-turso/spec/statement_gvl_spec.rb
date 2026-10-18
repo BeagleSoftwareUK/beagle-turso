@@ -50,9 +50,9 @@ RSpec.describe "GVL release during statements" do
 
   # Runs the block on a fresh thread under an explicit worker-pool scheduler,
   # so the result doesn't depend on ASYNC_SCHEDULER_WORKER_POOL or load order.
-  def with_worker_pool_scheduler(&blk)
+  def with_worker_pool_scheduler(worker_pool = true, &blk)
     Thread.new do
-      scheduler = Async::Scheduler.new(worker_pool: true)
+      scheduler = Async::Scheduler.new(worker_pool: worker_pool)
       Fiber.set_scheduler(scheduler)
       scheduler.run(&blk)
     end.join
@@ -90,17 +90,30 @@ RSpec.describe "GVL release during statements" do
     expect(ticks).to be >= 0.5 * (elapsed / 0.01)
   end
 
-  it "a second fiber's query on its own connection completes after the long one" do
-    require_worker_pool!
-    require_long_sql!
-    db = open_db
-    conn_a = db.connect
-    conn_b = db.connect
+  # A two-worker pool: Async's default pool has one worker, which would queue
+  # fiber B behind A whatever the core does, so it can't show the statement
+  # lock serialising anything.
+  def two_worker_pool
+    pool = IO::Event::WorkerPool.new(maximum_worker_count: 2)
+    stats = pool.respond_to?(:statistics) ? pool.statistics : {}
+    if stats.key?(:maximum_worker_count) && stats[:maximum_worker_count] != 2
+      pool.close
+      skip "IO::Event::WorkerPool ignored maximum_worker_count: 2"
+    end
+    pool
+  rescue NameError, ArgumentError => e
+    skip "IO::Event::WorkerPool.new(maximum_worker_count: 2) unavailable: #{e.class}"
+  end
+
+  # Fiber A runs LONG_SQL on conn_a; 50 ms later fiber B runs SELECT 1 on
+  # conn_b; a ticker fiber runs throughout, all under a two-worker pool.
+  # Returns [a_done, b_done, b_result, ticks, started].
+  def race_long_and_short(conn_a, conn_b)
+    pool = two_worker_pool
     ticks = 0
-    a_done = b_done = b_result = nil
-    started = nil
+    a_done = b_done = b_result = started = nil
     Timeout.timeout(30) do
-      with_worker_pool_scheduler do
+      with_worker_pool_scheduler(pool) do
         ticker = Async { loop { ticks += 1; sleep 0.01 } }
         started = now
         a = Async { conn_a.query(StatementGvlSpec::LONG_SQL, []); a_done = now }
@@ -113,8 +126,28 @@ RSpec.describe "GVL release during statements" do
         ticker.stop
       end
     end
+    [a_done, b_done, b_result, ticks, started]
+  end
+
+  it "a second fiber's query on its own connection completes after the long one" do
+    require_worker_pool!
+    require_long_sql!
+    db = open_db
+    a_done, b_done, b_result, ticks, started = race_long_and_short(db.connect, db.connect)
     expect(b_result).to eq([[1]])
     expect(b_done).to be >= a_done - 0.05 # statements on one Database are serialised
+    expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
+  end
+
+  it "control: a second fiber's query on a different Database finishes long before the long one" do
+    require_worker_pool!
+    require_long_sql!
+    other = Beagle::Turso::Database.open_local(File.join(@dir, "other.db"))
+    a_done, b_done, b_result, ticks, started = race_long_and_short(open_db.connect, other.connect)
+    expect(b_result).to eq([[1]])
+    # With two workers and no shared statement lock, B doesn't wait for A; so
+    # the same-Database spec above is serialised by the lock, not the pool.
+    expect(b_done).to be < a_done - 1
     expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
   end
 
