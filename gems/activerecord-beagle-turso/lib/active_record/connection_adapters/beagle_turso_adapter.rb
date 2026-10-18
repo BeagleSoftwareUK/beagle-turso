@@ -111,9 +111,10 @@ module ActiveRecord
         attr_reader :database, :connection
 
         def initialize(database)
-          @database   = database
-          @connection = database.connect
-          @closed     = false
+          @database     = database
+          @connection   = database.connect
+          @closed       = false
+          @busy_timeout = nil
         end
 
         # A bare read of exactly +defer_foreign_keys+ or +read_uncommitted+
@@ -181,11 +182,39 @@ module ActiveRecord
         def push = database.push
         def pull = database.pull
 
-        # --- sqlite3-gem lifecycle shims the SQLite3Adapter drives ---
-        # configure_connection only touches this when config[:timeout] is set.
-        def busy_handler_timeout=(_)
-          nil
+        # --- busy handling ---
+        # configure_connection passes database.yml's `timeout:` (ms) here, as it
+        # does to the sqlite3 gem's busy handler. Unset or 0 means no waiting:
+        # a BusyError surfaces at once, as with the sqlite3 gem.
+        def busy_handler_timeout=(milliseconds)
+          @busy_timeout = milliseconds.to_i.positive? ? milliseconds.to_i / 1000.0 : nil
         end
+
+        # Retries a statement that lost the single-writer race, with capped
+        # exponential backoff, for up to the busy timeout. The engine never
+        # waits for a lock itself (from beagle-turso 0.4.0 it raises at once),
+        # so this is where the wait happens. sleep releases the GVL and yields
+        # to a fiber scheduler, so the writer holding the lock can finish. The
+        # caller decides what is safe to retry (see BeagleTursoAdapter#perform_query).
+        def retry_busy
+          deadline = nil
+          delay = 0.002
+          begin
+            yield
+          rescue ::Beagle::Turso::BusyError => e
+            raise if @busy_timeout.nil? || e.message.include?("snapshot is stale")
+
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            deadline ||= now + @busy_timeout
+            raise if now + delay > deadline
+
+            sleep delay
+            delay = [delay * 2, 0.1].min
+            retry
+          end
+        end
+
+        # --- sqlite3-gem lifecycle shims the SQLite3Adapter drives ---
         # connected? => !(@raw_connection.nil? || @raw_connection.closed?)
         def closed? = @closed
         # Release the beagle-turso session eagerly rather than waiting for GC.
@@ -356,32 +385,53 @@ module ActiveRecord
             if batch
               raw_connection.execute_batch(sql)
               ::ActiveRecord::Result.empty
-            elsif write_statement?(sql)
-              if (rewritten = sql_with_returning_rowid(sql))
-                insert_returning_rowid(raw_connection, rewritten, params)
-              else
-                affected = raw_connection.execute(sql, params)
-                @last_inserted_rowid = raw_connection.last_insert_rowid
-                ::ActiveRecord::Result.empty(affected_rows: affected)
-              end
+            elsif busy_retry?(sql)
+              raw_connection.retry_busy { run_statement(raw_connection, sql, params) }
             else
-              columns, rows = raw_connection.query_result(sql, params)
-              # Belt-and-suspenders: a RETURNING insert lands here (id read from
-              # rows by last_inserted_id), and a data-modifying CTE that slips past
-              # write_statement? would too -- keep the rowid so an inserted id is
-              # never silently lost even on a heuristic miss.
-              if INSERT_REGEX.match?(sql)
-                # On a replica where last_insert_rowid is untrustworthy, never
-                # offer it as a fallback id (a RETURNING insert's id is in rows).
-                @last_inserted_rowid = insert_returning_rowid? ? nil : raw_connection.last_insert_rowid
-              end
-              ::ActiveRecord::Result.new(columns, rows)
+              run_statement(raw_connection, sql, params)
             end
 
           verified!
           notification_payload[:affected_rows] = result.affected_rows
           notification_payload[:row_count]     = result.length
           result
+        end
+
+        # A busy statement is retried only when that is safe: the BEGIN that
+        # opens a transaction (Rails sends BEGIN IMMEDIATE, so a writer waits
+        # for the lock there rather than failing mid-way), or a statement
+        # outside any transaction. Inside one, a BusyError means the
+        # transaction is dead; it must surface and roll back. A multi-statement
+        # batch is never retried (it may have run in part).
+        BEGIN_REGEX = /\A\s*BEGIN\b/i
+        private_constant :BEGIN_REGEX
+
+        def busy_retry?(sql)
+          !transaction_open? || BEGIN_REGEX.match?(mask_non_code(sql))
+        end
+
+        def run_statement(raw_connection, sql, params)
+          if write_statement?(sql)
+            if (rewritten = sql_with_returning_rowid(sql))
+              insert_returning_rowid(raw_connection, rewritten, params)
+            else
+              affected = raw_connection.execute(sql, params)
+              @last_inserted_rowid = raw_connection.last_insert_rowid
+              ::ActiveRecord::Result.empty(affected_rows: affected)
+            end
+          else
+            columns, rows = raw_connection.query_result(sql, params)
+            # Belt-and-suspenders: a RETURNING insert lands here (id read from
+            # rows by last_inserted_id), and a data-modifying CTE that slips past
+            # write_statement? would too -- keep the rowid so an inserted id is
+            # never silently lost even on a heuristic miss.
+            if INSERT_REGEX.match?(sql)
+              # On a replica where last_insert_rowid is untrustworthy, never
+              # offer it as a fallback id (a RETURNING insert's id is in rows).
+              @last_inserted_rowid = insert_returning_rowid? ? nil : raw_connection.last_insert_rowid
+            end
+            ::ActiveRecord::Result.new(columns, rows)
+          end
         end
 
         # Route to the WRITE branch (execute -> affected count + last_insert_rowid)
