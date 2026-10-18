@@ -94,6 +94,9 @@ Queue recurring job — see the
 > constraints that the exclusive lock imposes — all of which fail in
 > non-obvious ways when missed. **[Setting up a new Rails app on
 > beagle_turso](docs/rails-app-setup.md)** is the full checklist.
+>
+> Hanami + Falcon on [Sequel](gems/sequel-beagle-turso#readme)? See
+> **[Setting up a Hanami app on Turso](docs/hanami-app-setup.md)**.
 
 ## Quick start (plain Ruby)
 
