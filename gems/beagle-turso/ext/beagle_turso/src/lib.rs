@@ -14,21 +14,70 @@
 // identical; the code is simpler and compiles with zero deprecation
 // warnings.
 
-// GVL: open_local, open, connect, push and pull (the calls that can wait on the
-// network or disk for a long time) run via nogvl::without_gvl with the GVL
-// released. Queries/execute stay under the GVL: they are short, local, and
-// release/reacquire would cost more than it saves.
+// GVL: open_local, open, connect, push and pull, and the five statement
+// methods (execute, query, query_result, query_result_with_types,
+// execute_batch) run via nogvl::without_gvl with the GVL released, so other
+// threads run and a worker-pool fiber scheduler offloads them off its reactor.
+// Statement params are converted to core values before the call and Ruby rows
+// built after it; the closure touches no Ruby object. The core serialises
+// statements per database file (its statement lock, shared by every Database
+// in the process opened on that file), so releasing the GVL adds no new write
+// overlap. `Beagle::Turso.statement_gvl = :hold` (or
+// BEAGLE_TURSO_STATEMENT_GVL=hold at load) runs statements under the GVL
+// instead, as in 0.3.0. last_insert_rowid, close and closed? stay under the
+// GVL: they are cheap.
 
 mod errors;
 mod nogvl;
 
-use beagle_turso_core::{Connection, Database, OpenOptions, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use beagle_turso_core::{Connection, Database, Error as CoreError, OpenOptions, Value};
 use errors::raise_core;
-use nogvl::without_gvl;
+use nogvl::{without_gvl, without_gvl_interruptible};
 use magnus::{
     encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
 };
+
+// Process-wide: true runs statements with the GVL held (`statement_gvl :hold`).
+static HOLD_STATEMENT_GVL: AtomicBool = AtomicBool::new(false);
+
+fn set_statement_gvl_hold(hold: bool) {
+    HOLD_STATEMENT_GVL.store(hold, Ordering::Relaxed);
+}
+
+fn statement_gvl_hold() -> bool {
+    HOLD_STATEMENT_GVL.load(Ordering::Relaxed)
+}
+
+// Never set: the interrupt flag for statements run under the GVL.
+static NEVER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+// Runs one statement: without the GVL by default, or directly under it when
+// the switch is `:hold`. `f` must touch no Ruby object; it returns the core
+// Result, which the caller maps to a Ruby exception once the GVL is back.
+//
+// Without the GVL, `f` gets the flag Ruby's unblocking function sets, so
+// Thread#raise/kill and Timeout stop a statement still waiting for another on
+// the same file (the core returns Interrupted; one already running finishes).
+// Ruby then raises its pending exception from without_gvl_interruptible. If it
+// has none to raise (a trap handler ran, say), the statement waits again.
+fn run_statement<F, R>(mut f: F) -> Result<Result<R, CoreError>, Error>
+where
+    F: FnMut(&AtomicBool) -> Result<R, CoreError> + Send,
+    R: Send,
+{
+    if statement_gvl_hold() {
+        return Ok(f(&NEVER_INTERRUPTED));
+    }
+    loop {
+        match without_gvl_interruptible(|flag| f(flag))? {
+            Err(CoreError::Interrupted) => continue,
+            done => return Ok(done),
+        }
+    }
+}
 
 #[magnus::wrap(class = "Beagle::Turso::Database", free_immediately)]
 struct RbDatabase {
@@ -166,17 +215,15 @@ fn rows_to_ruby(ruby: &Ruby, rows: Vec<beagle_turso_core::Row>) -> Result<RArray
 impl RbConnection {
     fn execute(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<u64, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        rb_self
-            .inner
-            .execute(&sql, &p)
+        let inner = &rb_self.inner;
+        run_statement(|i| inner.execute_interruptible(&sql, &p, i))?
             .map_err(|e| raise_core(ruby, e))
     }
 
     fn query(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<RArray, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        let rows = rb_self
-            .inner
-            .query(&sql, &p)
+        let inner = &rb_self.inner;
+        let rows = run_statement(|i| inner.query_result_interruptible(&sql, &p, i).map(|r| r.rows))?
             .map_err(|e| raise_core(ruby, e))?;
         rows_to_ruby(ruby, rows)
     }
@@ -192,10 +239,10 @@ impl RbConnection {
         params: RArray,
     ) -> Result<RArray, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        let result = rb_self
-            .inner
-            .query_result(&sql, &p)
-            .map_err(|e| raise_core(ruby, e))?;
+        let inner = &rb_self.inner;
+        let result =
+            run_statement(|i| inner.query_result_interruptible(&sql, &p, i))?
+                .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in &result.columns {
             columns.push(name.clone().into_value_with(ruby))?;
@@ -217,10 +264,10 @@ impl RbConnection {
         params: RArray,
     ) -> Result<RArray, Error> {
         let p = ruby_array_to_params(ruby, params)?;
-        let result = rb_self
-            .inner
-            .query_result(&sql, &p)
-            .map_err(|e| raise_core(ruby, e))?;
+        let inner = &rb_self.inner;
+        let result =
+            run_statement(|i| inner.query_result_interruptible(&sql, &p, i))?
+                .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in result.columns {
             columns.push(name)?;
@@ -244,9 +291,8 @@ impl RbConnection {
     }
 
     fn execute_batch(ruby: &Ruby, rb_self: &Self, sql: String) -> Result<(), Error> {
-        rb_self
-            .inner
-            .execute_batch(&sql)
+        let inner = &rb_self.inner;
+        run_statement(|i| inner.execute_batch_interruptible(&sql, i))?
             .map_err(|e| raise_core(ruby, e))
     }
 
@@ -265,6 +311,12 @@ impl RbConnection {
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let turso = ruby.define_module("Beagle")?.define_module("Turso")?;
+    // Back Beagle::Turso.statement_gvl / statement_gvl= (lib/beagle/turso.rb).
+    turso.define_module_function(
+        "_set_statement_gvl_hold",
+        function!(set_statement_gvl_hold, 1),
+    )?;
+    turso.define_module_function("_statement_gvl_hold?", function!(statement_gvl_hold, 0))?;
     let db = turso.define_class("Database", ruby.class_object())?;
     db.define_singleton_method("open_local", function!(RbDatabase::open_local, 1))?;
     // Positional primitive; the public keyword-arg `Database.open` wrapper

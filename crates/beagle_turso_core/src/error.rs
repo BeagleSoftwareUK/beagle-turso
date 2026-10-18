@@ -20,6 +20,10 @@ pub enum Error {
     Type(String),
     #[error("database is closed")]
     Closed,
+    /// An `*_interruptible` statement's interrupt flag was set while it waited
+    /// for another statement on the same file. The statement did not run.
+    #[error("statement interrupted before it ran")]
+    Interrupted,
     /// A handle opened in one process was used in a forked child.
     #[error("database opened in process {opened} used after fork in process {current}; open a new database in the child")]
     Forked { opened: u32, current: u32 },

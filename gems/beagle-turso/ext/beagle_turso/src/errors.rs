@@ -23,6 +23,9 @@ pub fn raise_core(ruby: &Ruby, e: CoreError) -> Error {
         CoreError::Busy(_) => "BusyError",
         CoreError::Closed => "ClosedError",
         CoreError::Forked { .. } => "ForkedError",
+        // Never raised: run_statement retries an interrupted wait, or Ruby
+        // raises its pending interrupt instead. The base class, to be safe.
+        CoreError::Interrupted => "Error",
         // Value conversion problems stay Ruby's TypeError, as in 0.1.x.
         CoreError::Type(_) => return Error::new(ruby.exception_type_error(), e.to_string()),
     };

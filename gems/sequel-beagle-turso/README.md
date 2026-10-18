@@ -101,8 +101,9 @@ The engine allows one writer at a time and reports contention immediately.
   `db.transaction(mode: ...)` overrides it per transaction.
 - Inside a transaction, contention surfaces as an error (and the transaction
   rolls back) instead of being retried.
-- Don't set `PRAGMA busy_timeout`. Its wait holds the GVL, so the writer that
-  holds the lock can't commit.
+- `PRAGMA busy_timeout` has no effect: from beagle-turso 0.4.0 the driver
+  never waits inside the engine, where the wait would stop the writer that
+  holds the lock from committing. Use `timeout:` instead.
 - Because of `BEGIN IMMEDIATE`, read-only `db.transaction { }` blocks and
   `Dataset#paged_each` take the write lock and queue behind writers. Pass
   `mode: :deferred` for read-only transactions.

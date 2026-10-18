@@ -1,0 +1,344 @@
+require "beagle/turso"
+require "timeout"
+require "tmpdir"
+require "open3"
+require "rbconfig"
+
+module StatementGvlSpec
+  LONG_SQL = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3000000) SELECT count(*) FROM c".freeze
+
+  class << self
+    attr_accessor :long_sql_time
+  end
+end
+
+RSpec.describe "GVL release during statements" do
+  def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  around do |ex|
+    Dir.mktmpdir("bt_stmt_gvl") do |dir|
+      @dir = dir
+      ex.run
+    end
+  end
+
+  def open_db = Beagle::Turso::Database.open_local(File.join(@dir, "t.db"))
+
+  # How long LONG_SQL takes on its own; measured once per process. The specs
+  # that depend on a long statement skip, rather than fail, on a machine where
+  # it is too quick to observe.
+  def long_sql_time
+    StatementGvlSpec.long_sql_time ||= begin
+      conn = Beagle::Turso::Database.open_local(":memory:").connect
+      started = now
+      conn.query(StatementGvlSpec::LONG_SQL, [])
+      now - started
+    end
+  end
+
+  def require_long_sql!
+    skip "LONG_SQL took #{long_sql_time.round(3)} s (< 0.3 s) on this machine" if long_sql_time < 0.3
+  end
+
+  def require_worker_pool!
+    require "async"
+    # Same guard as spec/gvl_spec.rb: blocking_operation_wait exists only when
+    # the scheduler has a worker pool (io-event >= 1.11).
+    skip "io-event has no WorkerPool" unless defined?(Async::Scheduler::WorkerPool) && Async::Scheduler::WorkerPool
+    skip "Ruby #{RUBY_VERSION} ignores RB_NOGVL_OFFLOAD_SAFE (needs >= 3.4)" if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")
+  end
+
+  # Runs the block on a fresh thread under an explicit worker-pool scheduler,
+  # so the result doesn't depend on ASYNC_SCHEDULER_WORKER_POOL or load order.
+  def with_worker_pool_scheduler(worker_pool = true, &blk)
+    Thread.new do
+      scheduler = Async::Scheduler.new(worker_pool: worker_pool)
+      Fiber.set_scheduler(scheduler)
+      scheduler.run(&blk)
+    end.join
+  end
+
+  # Runs LONG_SQL under the worker-pool scheduler beside a 10 ms ticker fiber.
+  # Returns [ticks, elapsed].
+  def ticks_during_long_query(conn)
+    ticks = 0
+    elapsed = nil
+    with_worker_pool_scheduler do
+      ticker = Async { loop { ticks += 1; sleep 0.01 } }
+      started = now
+      conn.query(StatementGvlSpec::LONG_SQL, [])
+      elapsed = now - started
+      ticker.stop
+    end
+    [ticks, elapsed]
+  end
+
+  it "lets other threads run during a long query" do
+    require_long_sql!
+    conn = open_db.connect
+    ticks = 0
+    ticker = Thread.new { loop { ticks += 1; Thread.pass } }
+    expect(conn.query(StatementGvlSpec::LONG_SQL, [])).to eq([[3_000_000]])
+    ticker.kill.join
+    expect(ticks).to be > 1_000
+  end
+
+  it "keeps an Async reactor responsive during a long query" do
+    require_worker_pool!
+    require_long_sql!
+    ticks, elapsed = ticks_during_long_query(open_db.connect)
+    expect(ticks).to be >= 0.5 * (elapsed / 0.01)
+  end
+
+  # A two-worker pool: Async's default pool has one worker, which would queue
+  # fiber B behind A whatever the core does, so it can't show the statement
+  # lock serialising anything.
+  def two_worker_pool
+    pool = IO::Event::WorkerPool.new(maximum_worker_count: 2)
+    stats = pool.respond_to?(:statistics) ? pool.statistics : {}
+    if stats.key?(:maximum_worker_count) && stats[:maximum_worker_count] != 2
+      pool.close
+      skip "IO::Event::WorkerPool ignored maximum_worker_count: 2"
+    end
+    pool
+  rescue NameError, ArgumentError => e
+    skip "IO::Event::WorkerPool.new(maximum_worker_count: 2) unavailable: #{e.class}"
+  end
+
+  # Fiber A runs LONG_SQL on conn_a; 50 ms later fiber B runs SELECT 1 on
+  # conn_b; a ticker fiber runs throughout, all under a two-worker pool.
+  # Returns [a_done, b_done, b_result, ticks, started].
+  def race_long_and_short(conn_a, conn_b)
+    pool = two_worker_pool
+    ticks = 0
+    a_done = b_done = b_result = started = nil
+    Timeout.timeout(30) do
+      with_worker_pool_scheduler(pool) do
+        ticker = Async { loop { ticks += 1; sleep 0.01 } }
+        started = now
+        a = Async { conn_a.query(StatementGvlSpec::LONG_SQL, []); a_done = now }
+        b = Async do
+          sleep 0.05
+          b_result = conn_b.query("SELECT 1", [])
+          b_done = now
+        end
+        [a, b].each(&:wait)
+        ticker.stop
+      end
+    end
+    [a_done, b_done, b_result, ticks, started]
+  end
+
+  it "a second fiber's query on its own connection completes after the long one" do
+    require_worker_pool!
+    require_long_sql!
+    db = open_db
+    a_done, b_done, b_result, ticks, started = race_long_and_short(db.connect, db.connect)
+    expect(b_result).to eq([[1]])
+    expect(b_done).to be >= a_done - 0.05 # statements on one Database are serialised
+    expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
+  end
+
+  # What an ActiveRecord pool does: one Database per pooled connection.
+  it "a second fiber's query through a second Database on the same file completes after the long one" do
+    require_worker_pool!
+    require_long_sql!
+    a_done, b_done, b_result, _ticks, _started = race_long_and_short(open_db.connect, open_db.connect)
+    expect(b_result).to eq([[1]])
+    expect(b_done).to be >= a_done - 0.05 # the lock is per file
+  end
+
+  it "control: a second fiber's query on a different file finishes long before the long one" do
+    require_worker_pool!
+    require_long_sql!
+    other = Beagle::Turso::Database.open_local(File.join(@dir, "other.db"))
+    a_done, b_done, b_result, ticks, started = race_long_and_short(open_db.connect, other.connect)
+    expect(b_result).to eq([[1]])
+    # With two workers and no shared statement lock, B (started 50 ms in, and
+    # instant) doesn't wait for A, which runs at least 0.3 s; so the specs
+    # above are serialised by the lock, not the pool.
+    expect(b_done - started).to be < 0.5 * (a_done - started)
+    expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
+  end
+
+  # Eight threads, 200 inserts each, one connection per thread from `dbs` in turn.
+  def parallel_inserts(dbs)
+    dbs.first.connect.execute("CREATE TABLE t (n INTEGER)", [])
+    threads = 8.times.map do |i|
+      conn = dbs[i % dbs.size].connect
+      Thread.new do
+        200.times { |j| conn.execute("INSERT INTO t (n) VALUES (?)", [i * 1_000 + j]) }
+      end
+    end
+    threads.each(&:join) # re-raises any BusyError
+    dbs.first.connect.query("SELECT count(*) FROM t", [])
+  end
+
+  it "parallel thread inserts on separate connections never raise BusyError" do
+    expect(parallel_inserts([open_db])).to eq([[1_600]])
+  end
+
+  it "parallel thread inserts through separate Databases on one file never raise BusyError" do
+    expect(parallel_inserts([open_db, open_db])).to eq([[1_600]])
+  end
+
+  it "Timeout stops a statement still waiting for another on the same file" do
+    require_long_sql!
+    long = open_db.connect
+    waiter = open_db.connect
+    a = Thread.new { long.query(StatementGvlSpec::LONG_SQL, []) }
+    sleep 0.1 # A takes the lock; it holds it for at least 0.3 s
+    started = now
+    expect { Timeout.timeout(0.05) { waiter.query("SELECT 1", []) } }.to raise_error(Timeout::Error)
+    waited = now - started
+    expect(a).to be_alive # the wait was cut short, not ended by A finishing
+    expect(waited).to be < 0.25
+    expect(a.value).to eq([[3_000_000]])
+    expect(waiter.query("SELECT 1", [])).to eq([[1]])
+  end
+
+  it "Timeout during a long query is delivered after it returns and the connection still works" do
+    require_long_sql!
+    conn = open_db.connect
+    started = now
+    expect { Timeout.timeout(0.05) { conn.query(StatementGvlSpec::LONG_SQL, []) } }.to raise_error(Timeout::Error)
+    expect(now - started).to be >= long_sql_time * 0.8
+    expect(conn.query("SELECT 1", [])).to eq([[1]])
+  end
+
+  describe "errors keep their class and message" do
+    def error_of
+      yield
+      nil
+    rescue => e
+      [e.class, e.message]
+    end
+
+    # Each case runs once with the GVL released and once held; the class and
+    # message must be identical (i.e. byte-for-byte what 0.3.0 raised).
+    def both_modes(&blk)
+      Beagle::Turso.statement_gvl = :release
+      released = error_of(&blk)
+      Beagle::Turso.statement_gvl = :hold
+      held = error_of(&blk)
+      [released, held]
+    ensure
+      Beagle::Turso.statement_gvl = :release
+    end
+
+    it "for a syntax error" do
+      conn = open_db.connect
+      %i[query query_result query_result_with_types execute].each do |m|
+        released, held = both_modes { conn.public_send(m, "SELEC nonsense", []) }
+        expect(released.first).to eq(Beagle::Turso::QueryError)
+        expect(released.last).to start_with("query failed: ")
+        expect(released).to eq(held)
+      end
+      released, held = both_modes { conn.execute_batch("SELEC nonsense;") }
+      expect(released.first).to eq(Beagle::Turso::QueryError)
+      expect(released).to eq(held)
+    end
+
+    it "for a UNIQUE violation" do
+      conn = open_db.connect
+      conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT UNIQUE)", [])
+      conn.execute("INSERT INTO u (k) VALUES ('a')", [])
+      released, held = both_modes { conn.execute("INSERT INTO u (k) VALUES ('a')", []) }
+      expect(released.first).to eq(Beagle::Turso::QueryError)
+      expect(released.last).to match(/UNIQUE/i)
+      expect(released).to eq(held)
+    end
+
+    it "for a closed connection" do
+      conn = open_db.connect
+      conn.close
+      %i[query query_result query_result_with_types execute].each do |m|
+        released, held = both_modes { conn.public_send(m, "SELECT 1", []) }
+        expect(released).to eq([Beagle::Turso::ClosedError, "database is closed"])
+        expect(released).to eq(held)
+      end
+      expect(both_modes { conn.execute_batch("SELECT 1;") }.uniq)
+        .to eq([[Beagle::Turso::ClosedError, "database is closed"]])
+    end
+
+    it "for an unsupported bind parameter (converted before the GVL is released)" do
+      conn = open_db.connect
+      released, held = both_modes { conn.query("SELECT ?", [Object.new]) }
+      expect(released).to eq([::TypeError, "unsupported bind parameter type"])
+      expect(released).to eq(held)
+    end
+
+    it "for an inherited connection in a forked child" do
+      skip "fork unsupported on this platform" unless Process.respond_to?(:fork)
+      conn = open_db.connect
+      rd, wr = IO.pipe
+      pid = fork do
+        rd.close
+        begin
+          conn.query("SELECT 1", [])
+          wr.write("no error")
+        rescue Beagle::Turso::ForkedError => e
+          wr.write("forked:#{e.message}")
+        rescue => e
+          wr.write("other #{e.class}")
+        end
+        wr.close
+        exit!(0)
+      end
+      wr.close
+      Timeout.timeout(10) { Process.wait(pid) }
+      expect(rd.read).to match(/\Aforked:database opened in process \d+ used after fork in process \d+; open a new database in the child\z/)
+      expect(conn.query("SELECT 1", [])).to eq([[1]])
+    end
+  end
+
+  it "statement_gvl = :hold keeps the reactor blocked" do
+    require_worker_pool!
+    require_long_sql!
+    begin
+      Beagle::Turso.statement_gvl = :hold
+      expect(Beagle::Turso.statement_gvl).to eq(:hold)
+      ticks, _elapsed = ticks_during_long_query(open_db.connect)
+      expect(ticks).to be < 5
+    ensure
+      Beagle::Turso.statement_gvl = :release
+    end
+    expect(Beagle::Turso.statement_gvl).to eq(:release)
+  end
+
+  it "statement_gvl rejects other values" do
+    expect { Beagle::Turso.statement_gvl = :foo }
+      .to raise_error(ArgumentError, "statement_gvl must be :hold or :release")
+    expect(Beagle::Turso.statement_gvl).to eq(:release)
+  end
+
+  describe "BEAGLE_TURSO_STATEMENT_GVL, read at load" do
+    # Loads the gem in a child process with the variable set (nil: unset).
+    # Returns [mode it printed, stderr].
+    def mode_at_load(value)
+      lib = File.expand_path("../lib", __dir__)
+      cmd = [RbConfig.ruby, "-I", lib, "-rbeagle/turso", "-e", "print Beagle::Turso.statement_gvl"]
+      out, err, status = Open3.capture3({"BEAGLE_TURSO_STATEMENT_GVL" => value}, *cmd)
+      expect(status).to be_success
+      [out, err]
+    end
+
+    it "hold, in any case and with surrounding space, holds the GVL" do
+      ["hold", "HOLD", " Hold\n"].each do |value|
+        expect(mode_at_load(value)).to eq(["hold", ""])
+      end
+    end
+
+    it "release, empty or unset releases it quietly" do
+      ["release", "RELEASE", "", nil].each do |value|
+        expect(mode_at_load(value)).to eq(["release", ""])
+      end
+    end
+
+    it "anything else releases it, with a warning" do
+      out, err = mode_at_load("hodl")
+      expect(out).to eq("release")
+      expect(err).to include('ignoring BEAGLE_TURSO_STATEMENT_GVL="hodl" (expected hold or release)')
+    end
+  end
+end

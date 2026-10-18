@@ -125,8 +125,26 @@ still a `RuntimeError`. A replica file already held by another process raises
 - One `Database` may be shared by threads. Give each thread its own
   `Connection`; a shared `Connection` works but serializes its callers.
 - `open`, `connect`, `push` and `pull` release the GVL, so other threads keep
-  running while they wait on the network. Queries keep it; they are local and
-  fast.
+  running while they wait on the network.
+- Statements (`execute`, `query`, `query_result`, `query_result_with_types`,
+  `execute_batch`) also release the GVL, so a long query or bulk import doesn't
+  stop other threads. Statements on one database file still run one at a
+  time, as they did under the GVL. That covers every connection of every
+  `Database` the process opened on that file, such as one per connection in
+  an ActiveRecord pool. A statement waits for the one in flight, never for a
+  whole transaction or import. Reads wait too: a long `SELECT` holds up every
+  other statement on that file until it finishes. The engine can't run them
+  side by side safely, so put long reports on a dedicated thread or worker.
+- A statement never waits inside the engine for a busy write lock: it raises
+  `BusyError` at once, and `PRAGMA busy_timeout` has no effect. A wait there
+  would block the transaction holding the lock from committing. Retry
+  `BusyError` in your own code, as the Sequel adapter does.
+- To keep statements under the GVL (the 0.3.0 behaviour), set
+  `BEAGLE_TURSO_STATEMENT_GVL=hold` (read once, when the gem loads; any case)
+  or call `Beagle::Turso.statement_gvl = :hold`; `:release` is the default.
+  Any other value of the variable is ignored, with a warning.
+  `Beagle::Turso.statement_gvl` returns the current mode. The setting is
+  process-wide.
 - While one thread pushes, `closed?` returns immediately on other threads, and
   queries on other connections proceed.
 - On a synced database, `connect` called while another thread is pushing waits
@@ -136,14 +154,19 @@ still a `RuntimeError`. A replica file already held by another process raises
   request.
 - `close` during an in-flight `push` is safe: the push finishes or raises, and
   later calls raise `ClosedError`.
-- A blocked native call cannot be interrupted: `Timeout` and `Thread#kill`
-  take effect when it returns.
+- A statement still waiting for another on the same file stops at once for
+  `Timeout`, `Thread#raise` or `Thread#kill`; it has not run. Once a statement
+  has started, it cannot be interrupted, and neither can `open`, `connect`,
+  `push` or `pull`: `Timeout` and `Thread#kill` take effect when the call
+  returns.
 - **Falcon / Async:** on Ruby 4.0+ with `async` 2.25+ (enable its worker pool
   with `ASYNC_SCHEDULER_WORKER_POOL=true` or
   `Async::Scheduler.new(worker_pool: true)`), a fiber scheduler runs these
-  calls on a worker thread, so the reactor keeps serving other requests during
-  a sync. On Ruby 3.3/3.4 the GVL is still released, but the scheduler's own
-  thread blocks. Run sync from a dedicated thread there. Run one Falcon
+  calls and statements on a worker thread, so the reactor keeps serving other
+  requests during a sync or a long statement. A fiber's query waits (off the
+  reactor) for any statement in flight on the same file. On Ruby 3.3/3.4
+  the GVL is still released, but nothing is offloaded: the scheduler's own
+  thread blocks. Run sync and long imports from a dedicated thread there. Run one Falcon
   process per replica (`--count 1`): the replica file is locked to one
   process.
 - **Fork:** handles are bound to the process that opened them. In a forked

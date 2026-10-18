@@ -3,16 +3,20 @@
 // move the call to a worker thread (keeping its reactor live).
 //
 // The closure must not touch any Ruby object: convert arguments before calling
-// and build Ruby results after it returns. No unblocking function is passed,
-// so Thread#raise/kill (and Timeout) are delivered only once the call returns:
-// rb_nogvl then raises the pending interrupt by longjmp. That is caught with
-// rb_protect (magnus::rb_sys::protect), so it never unwinds through Rust
-// frames; any value the native call produced is dropped normally (for `open`,
-// the Database is closed) and the exception comes back as `Err`.
+// and build Ruby results after it returns. `without_gvl` passes no unblocking
+// function, so Thread#raise/kill (and Timeout) are delivered only once the
+// call returns. `without_gvl_interruptible` passes one that sets a flag the
+// closure can watch, so it can stop *waiting* early; work it has begun still
+// runs to the end. Either way, rb_nogvl then raises the pending interrupt by
+// longjmp. That is caught with rb_protect (magnus::rb_sys::protect), so it
+// never unwinds through Rust frames; any value the native call produced is
+// dropped normally (for `open`, the Database is closed) and the exception
+// comes back as `Err`.
 
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use magnus::Error;
 
@@ -36,19 +40,50 @@ where
     ptr::null_mut()
 }
 
+// The unblocking function: Ruby calls it, holding the GVL, from the thread that
+// wants to interrupt this one. It only sets the flag.
+unsafe extern "C" fn set_flag(data: *mut c_void) {
+    (*(data as *const AtomicBool)).store(true, Ordering::Release);
+}
+
 pub fn without_gvl<F, R>(f: F) -> Result<R, Error>
 where
     F: FnOnce() -> R + Send,
     R: Send,
 {
+    call_without_gvl(f, None)
+}
+
+pub fn without_gvl_interruptible<F, R>(f: F) -> Result<R, Error>
+where
+    F: FnOnce(&AtomicBool) -> R + Send,
+    R: Send,
+{
+    let flag = AtomicBool::new(false);
+    let flag = &flag;
+    call_without_gvl(move || f(flag), Some(flag))
+}
+
+fn call_without_gvl<F, R>(f: F, interrupt: Option<&AtomicBool>) -> Result<R, Error>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
     let mut call = Call { f: Some(f), out: None };
+    let (ubf, ubf_data) = match interrupt {
+        Some(flag) => (
+            Some(set_flag as unsafe extern "C" fn(*mut c_void)),
+            flag as *const AtomicBool as *mut c_void,
+        ),
+        None => (None, ptr::null_mut()),
+    };
     let protected = magnus::rb_sys::protect(|| {
         unsafe {
             rb_sys::rb_nogvl(
                 Some(trampoline::<F, R>),
                 &mut call as *mut Call<F, R> as *mut c_void,
-                None,
-                ptr::null_mut(),
+                ubf,
+                ubf_data,
                 RB_NOGVL_OFFLOAD_SAFE,
             );
         }
