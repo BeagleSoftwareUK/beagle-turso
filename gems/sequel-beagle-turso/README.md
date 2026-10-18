@@ -187,6 +187,13 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
     top id can be reused;
   - partial indexes are not recreated;
   - a column's `COLLATE` is dropped.
+
+  On a synced replica, `rename_column` also keeps the table's own foreign keys
+  (re-added with the new column name, self-references included), but it is
+  refused when another table's foreign key references the column: the rebuild
+  can't update that reference, and both tables would become unwritable. Rebuild
+  the referencing table as well, or apply the rename on the remote and pull.
+  `drop_column` of a foreign key column drops that foreign key with it.
 - **Insert return values.** `Dataset#insert` returns the last inserted row's
   rowid. An `ON CONFLICT DO UPDATE` upsert returns the updated row's rowid, and
   an insert that is ignored (`insert_ignore`, `ON CONFLICT DO NOTHING`) returns

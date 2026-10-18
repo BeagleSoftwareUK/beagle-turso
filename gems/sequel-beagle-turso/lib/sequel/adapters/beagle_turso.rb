@@ -556,16 +556,41 @@ module Sequel
         auto = auto_all.values.select { |h| h[:unique] && h[:columns].map(&:to_s) != pks }
         single = auto.select { |h| h[:columns].length == 1 }.map { |h| rn.(h[:columns]).first.to_s }
         constraints = auto.select { |h| h[:columns].length > 1 }.map { |h| { type: :unique, columns: rn.(h[:columns]) } }
+        refuse_rename_of_referenced_column(table, old, pks)
+        # Sequel would copy the foreign keys under the old column names; copy
+        # them ourselves with the renamed column. Self-references rename the
+        # referenced column (key) too. (The engine doesn't report DEFERRABLE.)
+        fks = foreign_key_list(table).map do |fk|
+          self_ref = fk[:table].to_s == table.to_s
+          fk.merge(type: :foreign_key, columns: rn.(fk[:columns]), key: (self_ref && fk[:key] ? rn.(fk[:key]) : fk[:key]))
+        end
+        constraints.concat(fks)
         named = indexes(table).select { |n, h| !auto_all.key?(n) && h[:columns].map(&:to_s).include?(old) }
 
         ncp = ->(nc) { nc.map! { |c| c.to_s == old ? new : c } }
-        sqls = duplicate_table(table, new_columns_proc: ncp, no_unique: true, constraints: constraints) do |cols|
+        sqls = duplicate_table(table, new_columns_proc: ncp, no_unique: true, no_foreign_keys: true, constraints: constraints) do |cols|
           cols.each do |c|
             c[:name] = new if c[:name].to_s == old
             c[:unique] = true if single.include?(c[:name].to_s) && !c[:primary_key]
           end
         end
         sqls + named.map { |name, h| alter_table_sql(table, h.merge(op: :add_index, name: name, columns: rn.(h[:columns]))) }
+      end
+
+      # A rebuild of this table can't update another table's foreign key that
+      # names the column, and the stale reference makes both tables unwritable.
+      def refuse_rename_of_referenced_column(table, old, pks)
+        referencing = tables.reject { |t| t.to_s == table.to_s }.select do |other|
+          foreign_key_list(other).any? do |fk|
+            fk[:table].to_s == table.to_s && (fk[:key] || pks).map(&:to_s).include?(old)
+          end
+        end
+        return if referencing.empty?
+
+        raise Error, "rename_column of #{table}.#{old} is refused on a synced replica: " \
+          "#{referencing.join(', ')} reference(s) it with a foreign key, and rebuilding #{table} cannot " \
+          "update that reference. Rebuild the referencing table(s) as well, or apply the rename on the " \
+          "remote database and pull."
       end
 
       def support_without_rowid?

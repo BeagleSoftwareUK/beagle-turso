@@ -100,6 +100,57 @@ RSpec.describe "renames on a synced replica" do
     end
   end
 
+  describe "rename_column with foreign keys" do
+    before do
+      db.run "PRAGMA foreign_keys = 1"
+      db.create_table(:par) { primary_key :id; String :code, unique: true }
+      db.create_table(:ch) { primary_key :id; foreign_key :par_id, :par, on_delete: :cascade, index: true }
+      db[:par].insert(code: "c1")
+      db[:ch].insert(par_id: 1)
+    end
+
+    it "keeps a child's foreign key under the new column name when synced" do
+      pretend_synced(db)
+      db.alter_table(:ch) { rename_column :par_id, :parent_id }
+      fk = db.foreign_key_list(:ch).first
+      expect(fk).to include(columns: [:parent_id], table: :par, on_delete: :cascade)
+      expect(db[:par].insert(code: "c2")).to eq(2)
+      expect(db[:ch].insert(parent_id: 2)).to eq(2)
+      expect { db[:ch].insert(parent_id: 99) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
+      db[:par].where(id: 2).delete
+      expect(db[:ch].select_map(:parent_id)).to eq([1])
+    end
+
+    it "renames the referenced column of a self-referencing foreign key" do
+      db.create_table(:tree) { primary_key :id; foreign_key :up, :tree, key: :id }
+      db.create_table(:tree2) { Integer :k, unique: true; foreign_key :up, :tree2, key: :k }
+      pretend_synced(db)
+      db.alter_table(:tree2) { rename_column :k, :key2 }
+      expect(db.foreign_key_list(:tree2).first).to include(columns: [:up], key: [:key2])
+      db.alter_table(:tree) { rename_column :up, :above }
+      expect(db.foreign_key_list(:tree).first).to include(columns: [:above], key: [:id])
+      db[:tree].insert(id: 1)
+      db[:tree].insert(id: 2, above: 1)
+      expect { db[:tree].insert(id: 3, above: 77) }.to raise_error(Sequel::ForeignKeyConstraintViolation)
+    end
+
+    it "refuses renaming a column another table's foreign key references, when synced" do
+      db.create_table(:ref) { primary_key :id; String :pcode; foreign_key [:pcode], :par, key: :code }
+      pretend_synced(db)
+      expect { db.alter_table(:par) { rename_column :code, :code2 } }
+        .to raise_error(Sequel::Error, /ref.*foreign key.*remote/m)
+      expect { db.alter_table(:par) { rename_column :id, :id2 } }.to raise_error(Sequel::Error, /ch/)
+      expect(db[:par].columns).to eq(%i[id code])
+    end
+
+    it "renames a referenced column natively on a local-only replica" do
+      db.create_table(:ref) { primary_key :id; String :pcode; foreign_key [:pcode], :par, key: :code }
+      sql = capture_sql(db) { db.alter_table(:par) { rename_column :code, :code2 } }
+      expect(sql).to match(/RENAME COLUMN/i)
+      expect(db[:par].columns).to eq(%i[id code2])
+    end
+  end
+
   it "rebuilds without RENAME on a local-only replica too" do
     db[:t].insert(name: "a")
     sql = capture_sql(db) { db.alter_table(:t) { set_column_allow_null :name, false } }
