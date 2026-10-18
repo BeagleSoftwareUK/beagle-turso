@@ -32,7 +32,15 @@ module Beagle
 
     private_class_method :_statement_gvl_hold?, :_set_statement_gvl_hold
 
-    self.statement_gvl = :hold if ENV["BEAGLE_TURSO_STATEMENT_GVL"] == "hold"
+    # Case and surrounding space don't matter. Anything else is most likely a
+    # typo in a rollback attempt, so it is reported rather than ignored.
+    case (env_gvl = ENV["BEAGLE_TURSO_STATEMENT_GVL"].to_s).strip.downcase
+    when "hold" then self.statement_gvl = :hold
+    when "", "release" then nil
+    else
+      warn "beagle-turso: ignoring BEAGLE_TURSO_STATEMENT_GVL=#{env_gvl.inspect} " \
+           "(expected hold or release); statements release the GVL"
+    end
 
     class Database
       # Opens a local-only database, or one synced with a remote Turso

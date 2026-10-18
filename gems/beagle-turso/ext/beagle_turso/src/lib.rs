@@ -20,8 +20,9 @@
 // threads run and a worker-pool fiber scheduler offloads them off its reactor.
 // Statement params are converted to core values before the call and Ruby rows
 // built after it; the closure touches no Ruby object. The core serialises
-// statements per Database (its statement lock), so releasing the GVL adds no
-// new write overlap. `Beagle::Turso.statement_gvl = :hold` (or
+// statements per database file (its statement lock, shared by every Database
+// in the process opened on that file), so releasing the GVL adds no new write
+// overlap. `Beagle::Turso.statement_gvl = :hold` (or
 // BEAGLE_TURSO_STATEMENT_GVL=hold at load) runs statements under the GVL
 // instead, as in 0.3.0. last_insert_rowid, close and closed? stay under the
 // GVL: they are cheap.
@@ -31,9 +32,9 @@ mod nogvl;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use beagle_turso_core::{Connection, Database, OpenOptions, Value};
+use beagle_turso_core::{Connection, Database, Error as CoreError, OpenOptions, Value};
 use errors::raise_core;
-use nogvl::without_gvl;
+use nogvl::{without_gvl, without_gvl_interruptible};
 use magnus::{
     encoding::EncodingCapable, function, method, prelude::*, Error, Float, Integer, IntoValue,
     RArray, RString, Ruby,
@@ -50,18 +51,31 @@ fn statement_gvl_hold() -> bool {
     HOLD_STATEMENT_GVL.load(Ordering::Relaxed)
 }
 
+// Never set: the interrupt flag for statements run under the GVL.
+static NEVER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 // Runs one statement: without the GVL by default, or directly under it when
 // the switch is `:hold`. `f` must touch no Ruby object; it returns the core
 // Result, which the caller maps to a Ruby exception once the GVL is back.
-fn run_statement<F, R>(f: F) -> Result<R, Error>
+//
+// Without the GVL, `f` gets the flag Ruby's unblocking function sets, so
+// Thread#raise/kill and Timeout stop a statement still waiting for another on
+// the same file (the core returns Interrupted; one already running finishes).
+// Ruby then raises its pending exception from without_gvl_interruptible. If it
+// has none to raise (a trap handler ran, say), the statement waits again.
+fn run_statement<F, R>(mut f: F) -> Result<Result<R, CoreError>, Error>
 where
-    F: FnOnce() -> R + Send,
+    F: FnMut(&AtomicBool) -> Result<R, CoreError> + Send,
     R: Send,
 {
     if statement_gvl_hold() {
-        Ok(f())
-    } else {
-        without_gvl(f)
+        return Ok(f(&NEVER_INTERRUPTED));
+    }
+    loop {
+        match without_gvl_interruptible(|flag| f(flag))? {
+            Err(CoreError::Interrupted) => continue,
+            done => return Ok(done),
+        }
     }
 }
 
@@ -202,13 +216,15 @@ impl RbConnection {
     fn execute(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<u64, Error> {
         let p = ruby_array_to_params(ruby, params)?;
         let inner = &rb_self.inner;
-        run_statement(|| inner.execute(&sql, &p))?.map_err(|e| raise_core(ruby, e))
+        run_statement(|i| inner.execute_interruptible(&sql, &p, i))?
+            .map_err(|e| raise_core(ruby, e))
     }
 
     fn query(ruby: &Ruby, rb_self: &Self, sql: String, params: RArray) -> Result<RArray, Error> {
         let p = ruby_array_to_params(ruby, params)?;
         let inner = &rb_self.inner;
-        let rows = run_statement(|| inner.query(&sql, &p))?.map_err(|e| raise_core(ruby, e))?;
+        let rows = run_statement(|i| inner.query_result_interruptible(&sql, &p, i).map(|r| r.rows))?
+            .map_err(|e| raise_core(ruby, e))?;
         rows_to_ruby(ruby, rows)
     }
 
@@ -225,7 +241,8 @@ impl RbConnection {
         let p = ruby_array_to_params(ruby, params)?;
         let inner = &rb_self.inner;
         let result =
-            run_statement(|| inner.query_result(&sql, &p))?.map_err(|e| raise_core(ruby, e))?;
+            run_statement(|i| inner.query_result_interruptible(&sql, &p, i))?
+                .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in &result.columns {
             columns.push(name.clone().into_value_with(ruby))?;
@@ -249,7 +266,8 @@ impl RbConnection {
         let p = ruby_array_to_params(ruby, params)?;
         let inner = &rb_self.inner;
         let result =
-            run_statement(|| inner.query_result(&sql, &p))?.map_err(|e| raise_core(ruby, e))?;
+            run_statement(|i| inner.query_result_interruptible(&sql, &p, i))?
+                .map_err(|e| raise_core(ruby, e))?;
         let columns = ruby.ary_new();
         for name in result.columns {
             columns.push(name)?;
@@ -274,7 +292,8 @@ impl RbConnection {
 
     fn execute_batch(ruby: &Ruby, rb_self: &Self, sql: String) -> Result<(), Error> {
         let inner = &rb_self.inner;
-        run_statement(|| inner.execute_batch(&sql))?.map_err(|e| raise_core(ruby, e))
+        run_statement(|i| inner.execute_batch_interruptible(&sql, i))?
+            .map_err(|e| raise_core(ruby, e))
     }
 
     // Release the underlying connection handle instead of waiting for GC.

@@ -27,12 +27,16 @@
 
 mod error;
 mod runtime;
+mod stmt_lock;
 mod value;
 
 use std::mem::ManuallyDrop;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use runtime::{new_runtime, SharedRt};
+use stmt_lock::StmtLock;
 
 pub use error::{Error, Result};
 pub use value::Value;
@@ -121,16 +125,17 @@ enum Inner {
 /// `Option`; an operation still in flight keeps its own `Arc` and finishes,
 /// and the engine is released when the last one drops. `None` means closed.
 /// `sync_lock` serializes `push`/`pull` against each other only.
-/// `stmt_lock` is shared with every [`Connection`] from this database and is
-/// held for exactly one statement, so statements never overlap within a
-/// database (the engine reports overlapping autocommit writers as busy).
+/// `stmt_lock` is shared with every [`Connection`] from this database, and
+/// with every other `Database` in this process opened on the same file. It is
+/// held for exactly one statement, so statements on a file never overlap (the
+/// engine reports overlapping autocommit writers as busy).
 /// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Database {
     rt: ManuallyDrop<SharedRt>,
     pid: u32,
     inner: Mutex<Option<Arc<Inner>>>,
     sync_lock: Mutex<()>,
-    stmt_lock: Arc<Mutex<()>>,
+    stmt_lock: Arc<StmtLock>,
 }
 
 /// A connection to a [`Database`], used to run SQL.
@@ -145,7 +150,7 @@ pub struct Database {
 pub struct Connection {
     rt: ManuallyDrop<SharedRt>,
     pid: u32,
-    stmt_lock: Arc<Mutex<()>>,
+    stmt_lock: Arc<StmtLock>,
     conn: Mutex<Option<turso::Connection>>,
 }
 
@@ -178,7 +183,7 @@ impl Database {
             pid: std::process::id(),
             inner: Mutex::new(Some(Arc::new(inner))),
             sync_lock: Mutex::new(()),
-            stmt_lock: Arc::new(Mutex::new(())),
+            stmt_lock: stmt_lock::for_path(&opts.local_path),
         })
     }
 
@@ -317,18 +322,59 @@ impl Drop for Database {
 }
 
 impl Connection {
-    pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+    /// Runs `run` on the engine connection as one statement: takes the
+    /// statement lock (giving up with [`Error::Interrupted`] if `interrupt` is
+    /// set while it waits), then `conn`.
+    ///
+    /// The engine's busy wait is turned off first, whatever `PRAGMA
+    /// busy_timeout` set. A busy wait would hold the statement lock, so the
+    /// connection holding the write lock could never take it to COMMIT and
+    /// the wait would always run to its full timeout. Busy is returned at
+    /// once instead; callers retry it without the lock.
+    fn statement<T>(
+        &self,
+        interrupt: Option<&AtomicBool>,
+        run: impl FnOnce(&turso::Connection) -> Result<T>,
+    ) -> Result<T> {
         check_pid(self.pid)?;
-        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _stmt = self.stmt_lock.acquire(interrupt)?;
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
-        let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
-        let result = self.rt.block_on(async {
-            conn.execute(sql, tparams)
-                .await
-                .map_err(|e| Error::from_engine(Error::Query, e))
-        });
-        result
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| Error::from_engine(Error::Query, e))?;
+        run(conn)
+    }
+
+    pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        self.execute_inner(sql, params, None)
+    }
+
+    /// Like [`Connection::execute`], but while waiting for another statement
+    /// on the same file to finish, returns [`Error::Interrupted`] once
+    /// `interrupt` is set. A statement that has started always runs to the end.
+    pub fn execute_interruptible(
+        &self,
+        sql: &str,
+        params: &[Value],
+        interrupt: &AtomicBool,
+    ) -> Result<u64> {
+        self.execute_inner(sql, params, Some(interrupt))
+    }
+
+    fn execute_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        interrupt: Option<&AtomicBool>,
+    ) -> Result<u64> {
+        self.statement(interrupt, |conn| {
+            let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
+            self.rt.block_on(async {
+                conn.execute(sql, tparams)
+                    .await
+                    .map_err(|e| Error::from_engine(Error::Query, e))
+            })
+        })
     }
 
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
@@ -339,47 +385,64 @@ impl Connection {
     /// names — needed by callers (e.g. an ActiveRecord adapter) that must
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        check_pid(self.pid)?;
-        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let conn = guard.as_ref().ok_or(Error::Closed)?;
-        let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
-        let result = self.rt.block_on(async {
-            let mut rows = conn
-                .query(sql, tparams)
-                .await
-                .map_err(|e| Error::from_engine(Error::Query, e))?;
-            // turso::Rows::columns() reads metadata off the prepared statement,
-            // so it's available before stepping and fixed for the result set.
-            let cols = rows.columns();
-            let columns = cols.iter().map(|c| c.name().to_string()).collect();
-            let decl_types = cols
-                .iter()
-                .map(|c| c.decl_type().map(str::to_string))
-                .collect();
-            let mut out = Vec::new();
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| Error::from_engine(Error::Query, e))?
-            {
-                let n = row.column_count();
-                let mut vals = Vec::with_capacity(n);
-                for i in 0..n {
-                    let cv = row
-                        .get_value(i)
-                        .map_err(|e| Error::from_engine(Error::Query, e))?;
-                    vals.push(Value::from_turso(cv));
+        self.query_result_inner(sql, params, None)
+    }
+
+    /// [`Connection::query_result`] with an interrupt flag; see
+    /// [`Connection::execute_interruptible`].
+    pub fn query_result_interruptible(
+        &self,
+        sql: &str,
+        params: &[Value],
+        interrupt: &AtomicBool,
+    ) -> Result<QueryResult> {
+        self.query_result_inner(sql, params, Some(interrupt))
+    }
+
+    fn query_result_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        interrupt: Option<&AtomicBool>,
+    ) -> Result<QueryResult> {
+        self.statement(interrupt, |conn| {
+            let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
+            self.rt.block_on(async {
+                let mut rows = conn
+                    .query(sql, tparams)
+                    .await
+                    .map_err(|e| Error::from_engine(Error::Query, e))?;
+                // turso::Rows::columns() reads metadata off the prepared statement,
+                // so it's available before stepping and fixed for the result set.
+                let cols = rows.columns();
+                let columns = cols.iter().map(|c| c.name().to_string()).collect();
+                let decl_types = cols
+                    .iter()
+                    .map(|c| c.decl_type().map(str::to_string))
+                    .collect();
+                let mut out = Vec::new();
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| Error::from_engine(Error::Query, e))?
+                {
+                    let n = row.column_count();
+                    let mut vals = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let cv = row
+                            .get_value(i)
+                            .map_err(|e| Error::from_engine(Error::Query, e))?;
+                        vals.push(Value::from_turso(cv));
+                    }
+                    out.push(Row { values: vals });
                 }
-                out.push(Row { values: vals });
-            }
-            Ok(QueryResult {
-                columns,
-                decl_types,
-                rows: out,
+                Ok(QueryResult {
+                    columns,
+                    decl_types,
+                    rows: out,
+                })
             })
-        });
-        result
+        })
     }
 
     /// Returns the rowid of the last row inserted by this connection.
@@ -404,16 +467,23 @@ impl Connection {
     /// `;` — so statements containing `;` inside string literals (e.g.
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        check_pid(self.pid)?;
-        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let conn = guard.as_ref().ok_or(Error::Closed)?;
-        let result = self.rt.block_on(async {
-            conn.execute_batch(sql)
-                .await
-                .map_err(|e| Error::from_engine(Error::Query, e))
-        });
-        result
+        self.execute_batch_inner(sql, None)
+    }
+
+    /// [`Connection::execute_batch`] with an interrupt flag; see
+    /// [`Connection::execute_interruptible`].
+    pub fn execute_batch_interruptible(&self, sql: &str, interrupt: &AtomicBool) -> Result<()> {
+        self.execute_batch_inner(sql, Some(interrupt))
+    }
+
+    fn execute_batch_inner(&self, sql: &str, interrupt: Option<&AtomicBool>) -> Result<()> {
+        self.statement(interrupt, |conn| {
+            self.rt.block_on(async {
+                conn.execute_batch(sql)
+                    .await
+                    .map_err(|e| Error::from_engine(Error::Query, e))
+            })
+        })
     }
 
     /// Close this connection, releasing the underlying `turso::Connection`

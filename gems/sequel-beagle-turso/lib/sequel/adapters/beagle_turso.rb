@@ -281,7 +281,8 @@ module Sequel
         reject_url_credentials
         # The engine allows one writer and reports contention immediately; we
         # wait in Ruby (see retry_busy), never with PRAGMA busy_timeout, whose
-        # wait holds the GVL so the lock holder can't commit.
+        # wait would stop the lock holder committing (the driver ignores it
+        # from 0.4.0).
         @busy_retries = BusyCounter.new
         @busy_timeout = typecast_value_integer(@opts.fetch(:timeout, 5000)) / 1000.0
         # Take the write lock at BEGIN, so a transaction that can't get it

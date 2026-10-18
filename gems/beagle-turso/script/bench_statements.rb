@@ -105,9 +105,9 @@ end
 
 warm_process
 res = Hash.new { |h, k| h[k] = [] }
-RUNS.times do
+RUNS.times do |run|
   # Alternate mode order per run so drift doesn't favour one mode.
-  order = res[:flip] = !res[:flip] ? MODES : MODES.reverse
+  order = run.even? ? MODES : MODES.reverse
   order.each do |mode|
     Beagle::Turso.statement_gvl = mode
     %i[a b c].each { |k| res[[k, mode]] << select_case(k) }

@@ -139,29 +139,62 @@ RSpec.describe "GVL release during statements" do
     expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
   end
 
-  it "control: a second fiber's query on a different Database finishes long before the long one" do
+  # What an ActiveRecord pool does: one Database per pooled connection.
+  it "a second fiber's query through a second Database on the same file completes after the long one" do
+    require_worker_pool!
+    require_long_sql!
+    a_done, b_done, b_result, _ticks, _started = race_long_and_short(open_db.connect, open_db.connect)
+    expect(b_result).to eq([[1]])
+    expect(b_done).to be >= a_done - 0.05 # the lock is per file
+  end
+
+  it "control: a second fiber's query on a different file finishes long before the long one" do
     require_worker_pool!
     require_long_sql!
     other = Beagle::Turso::Database.open_local(File.join(@dir, "other.db"))
     a_done, b_done, b_result, ticks, started = race_long_and_short(open_db.connect, other.connect)
     expect(b_result).to eq([[1]])
-    # With two workers and no shared statement lock, B doesn't wait for A; so
-    # the same-Database spec above is serialised by the lock, not the pool.
-    expect(b_done).to be < a_done - 1
+    # With two workers and no shared statement lock, B (started 50 ms in, and
+    # instant) doesn't wait for A, which runs at least 0.3 s; so the specs
+    # above are serialised by the lock, not the pool.
+    expect(b_done - started).to be < 0.5 * (a_done - started)
     expect(ticks).to be >= 0.5 * ((a_done - started) / 0.01)
   end
 
-  it "parallel thread inserts on separate connections never raise BusyError" do
-    db = open_db
-    db.connect.execute("CREATE TABLE t (n INTEGER)", [])
+  # Eight threads, 200 inserts each, one connection per thread from `dbs` in turn.
+  def parallel_inserts(dbs)
+    dbs.first.connect.execute("CREATE TABLE t (n INTEGER)", [])
     threads = 8.times.map do |i|
-      conn = db.connect
+      conn = dbs[i % dbs.size].connect
       Thread.new do
         200.times { |j| conn.execute("INSERT INTO t (n) VALUES (?)", [i * 1_000 + j]) }
       end
     end
     threads.each(&:join) # re-raises any BusyError
-    expect(db.connect.query("SELECT count(*) FROM t", [])).to eq([[1_600]])
+    dbs.first.connect.query("SELECT count(*) FROM t", [])
+  end
+
+  it "parallel thread inserts on separate connections never raise BusyError" do
+    expect(parallel_inserts([open_db])).to eq([[1_600]])
+  end
+
+  it "parallel thread inserts through separate Databases on one file never raise BusyError" do
+    expect(parallel_inserts([open_db, open_db])).to eq([[1_600]])
+  end
+
+  it "Timeout stops a statement still waiting for another on the same file" do
+    require_long_sql!
+    long = open_db.connect
+    waiter = open_db.connect
+    a = Thread.new { long.query(StatementGvlSpec::LONG_SQL, []) }
+    sleep 0.1 # A takes the lock; it holds it for at least 0.3 s
+    started = now
+    expect { Timeout.timeout(0.05) { waiter.query("SELECT 1", []) } }.to raise_error(Timeout::Error)
+    waited = now - started
+    expect(a).to be_alive # the wait was cut short, not ended by A finishing
+    expect(waited).to be < 0.25
+    expect(a.value).to eq([[3_000_000]])
+    expect(waiter.query("SELECT 1", [])).to eq([[1]])
   end
 
   it "Timeout during a long query is delivered after it returns and the connection still works" do
@@ -279,14 +312,33 @@ RSpec.describe "GVL release during statements" do
     expect(Beagle::Turso.statement_gvl).to eq(:release)
   end
 
-  it "BEAGLE_TURSO_STATEMENT_GVL=hold is read at load" do
-    lib = File.expand_path("../lib", __dir__)
-    cmd = [RbConfig.ruby, "-I", lib, "-rbeagle/turso", "-e", "print Beagle::Turso.statement_gvl"]
-    held, status = Open3.capture2({"BEAGLE_TURSO_STATEMENT_GVL" => "hold"}, *cmd)
-    expect(status).to be_success
-    expect(held).to eq("hold")
-    released, status = Open3.capture2({"BEAGLE_TURSO_STATEMENT_GVL" => nil}, *cmd)
-    expect(status).to be_success
-    expect(released).to eq("release")
+  describe "BEAGLE_TURSO_STATEMENT_GVL, read at load" do
+    # Loads the gem in a child process with the variable set (nil: unset).
+    # Returns [mode it printed, stderr].
+    def mode_at_load(value)
+      lib = File.expand_path("../lib", __dir__)
+      cmd = [RbConfig.ruby, "-I", lib, "-rbeagle/turso", "-e", "print Beagle::Turso.statement_gvl"]
+      out, err, status = Open3.capture3({"BEAGLE_TURSO_STATEMENT_GVL" => value}, *cmd)
+      expect(status).to be_success
+      [out, err]
+    end
+
+    it "hold, in any case and with surrounding space, holds the GVL" do
+      ["hold", "HOLD", " Hold\n"].each do |value|
+        expect(mode_at_load(value)).to eq(["hold", ""])
+      end
+    end
+
+    it "release, empty or unset releases it quietly" do
+      ["release", "RELEASE", "", nil].each do |value|
+        expect(mode_at_load(value)).to eq(["release", ""])
+      end
+    end
+
+    it "anything else releases it, with a warning" do
+      out, err = mode_at_load("hodl")
+      expect(out).to eq("release")
+      expect(err).to include('ignoring BEAGLE_TURSO_STATEMENT_GVL="hodl" (expected hold or release)')
+    end
   end
 end
