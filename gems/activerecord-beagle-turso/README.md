@@ -228,6 +228,20 @@ this gem.
    each sync — pick a sync cadence accordingly, or run Solid Queue in a separate
    process.
 
+## Known engine issue: self-referencing foreign keys
+
+Turso's engine has open bugs with foreign keys that reference their own table
+(such as `parent_id`): a multi-row `delete_all`, `update_all` or `DROP TABLE` that SQLite accepts can fail with
+`FOREIGN KEY constraint failed`, and `ON DELETE SET NULL` / `CASCADE` can leave
+rows behind or orphaned
+([tursodatabase/turso#8713](https://github.com/tursodatabase/turso/issues/8713),
+[#9279](https://github.com/tursodatabase/turso/issues/9279),
+[#9293](https://github.com/tursodatabase/turso/issues/9293),
+[#9294](https://github.com/tursodatabase/turso/issues/9294)). Foreign keys
+between two different tables are unaffected. Workaround: avoid `ON DELETE`
+actions on self-referencing foreign keys, and delete children before parents,
+one level at a time.
+
 ## License
 
 [MIT](https://opensource.org/licenses/MIT).

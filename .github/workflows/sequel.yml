@@ -1,0 +1,31 @@
+name: sequel
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby: ["3.3", "4.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          rustup-toolchain: stable
+          bundler-cache: true
+          cargo-cache: true
+          working-directory: gems/beagle-turso
+      # sequel-beagle-turso's Gemfile pulls in beagle-turso as a `path:`
+      # dependency (../beagle-turso), which has a native (Rust) extension.
+      # Bundler does not compile a path gem's extension as part of
+      # `bundle install`, so compile it explicitly first (see adapter.yml).
+      - run: bundle install
+        working-directory: gems/beagle-turso
+      - run: bundle exec rake compile
+        working-directory: gems/beagle-turso
+      - run: bundle install
+        working-directory: gems/sequel-beagle-turso
+      - run: bundle exec rspec
+        working-directory: gems/sequel-beagle-turso
+      - run: script/sequel-integration
+        working-directory: gems/sequel-beagle-turso

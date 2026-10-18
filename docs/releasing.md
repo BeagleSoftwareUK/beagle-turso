@@ -1,12 +1,13 @@
 # Releasing
 
-How to cut a release of the three packages in this repo:
+How to cut a release of the four packages in this repo:
 
 | Package | Registry | Version lives in |
 | --- | --- | --- |
 | `beagle_turso_core` | crates.io | `crates/beagle_turso_core/Cargo.toml` |
 | `beagle-turso` | RubyGems (source + precompiled platform gems) | `gems/beagle-turso/lib/beagle/turso/version.rb` |
 | `activerecord-beagle-turso` | RubyGems (pure Ruby) | `gems/activerecord-beagle-turso/lib/activerecord/beagle_turso/version.rb` |
+| `sequel-beagle-turso` | RubyGems (pure Ruby) | `gems/sequel-beagle-turso/lib/sequel/beagle_turso/version.rb` |
 
 A release is a `vX.Y.Z` tag pushed to GitHub. That triggers
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which
@@ -32,9 +33,10 @@ publish-crate ──┬── cross-gems (one job per platform) ──┬── 
    uses `fail-fast: false`, so one platform failing does not cancel the
    others.
 3. **`source-gem`** builds the `ruby`-platform `beagle-turso` gem, which
-   compiles on install and needs Rust, and the pure-Ruby adapter gem.
+   compiles on install and needs Rust, and the two pure-Ruby adapter gems.
 4. **`publish-gems`** pushes `beagle-turso` (every platform plus source)
-   first, then `activerecord-beagle-turso`, which depends on it. A version
+   first, then `activerecord-beagle-turso` and `sequel-beagle-turso`, which
+   depend on it. A version
    that was already pushed is skipped, so re-runs are safe.
 
 ## 1. Prepare the release
@@ -50,6 +52,8 @@ On a branch, before merging:
   - `gems/activerecord-beagle-turso/lib/activerecord/beagle_turso/version.rb`,
     plus its gemspec's `beagle-turso` dependency if the driver's minor
     version moved.
+  - `gems/sequel-beagle-turso/lib/sequel/beagle_turso/version.rb`, plus its
+    gemspec's `beagle-turso` dependency if the driver's minor version moved.
   - Run `cargo build` at the repo root and `bundle exec rake compile` in
     `gems/beagle-turso`, so both `Cargo.lock` files pick up the new crate
     version. Commit both lockfiles.
@@ -69,6 +73,7 @@ On a branch, before merging:
   cargo test && cargo fmt --check && cargo clippy --all-targets -- -D warnings
   (cd gems/beagle-turso && bundle exec rake compile && bundle exec rspec)
   (cd gems/activerecord-beagle-turso && bundle exec rspec)
+  (cd gems/sequel-beagle-turso && bundle exec rspec && script/sequel-integration)
   ```
 
   Check that the output shows **no pending** examples. A pending remote
@@ -82,7 +87,10 @@ Merge to `master`.
 
 ## 2. Trusted publishers (one-time setup)
 
-These are already set up for all three existing packages. Revisit this
+These are already set up for the three packages released so far
+(`beagle_turso_core`, `beagle-turso` and `activerecord-beagle-turso`).
+`sequel-beagle-turso` needs a **pending publisher on RubyGems before its first
+release**, set up as described below, or its first push will fail. Revisit this
 section only when **adding a new package**, such as a new gem:
 
 - **RubyGems** (rubygems.org → profile → Trusted Publishers → GitHub
@@ -131,6 +139,7 @@ Watch the `release` workflow run in the Actions tab. Things worth knowing:
   it, the adapter gem matches too. `aarch64-linux`, `x86_64-linux` and
   `x86_64-linux-musl` must be present.
 - `gem list -r -e activerecord-beagle-turso --all` shows the new version.
+- `gem list -r -e sequel-beagle-turso --all` shows the new version.
 - On a supported platform, `gem install beagle-turso -v X.Y.Z` installs
   without compiling. A `cargo` or `rustc` step in the output means it fell
   back to the source gem.
@@ -171,6 +180,7 @@ skip it.
   gem yank beagle-turso -v X.Y.Z --platform arm64-darwin    # if it published
   gem yank beagle-turso -v X.Y.Z --platform x86_64-darwin   # if it published
   gem yank activerecord-beagle-turso -v X.Y.Z               # pure Ruby: one gem
+  gem yank sequel-beagle-turso -v X.Y.Z                     # pure Ruby: one gem
   ```
 
 - **Yank a bad crate.** Run `cargo yank --version X.Y.Z beagle_turso_core`.

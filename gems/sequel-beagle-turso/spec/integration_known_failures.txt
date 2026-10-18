@@ -1,0 +1,25 @@
+# Sequel integration tests excluded for sequel-beagle-turso.
+# One per line: "<exact minitest test name> | <reason>". Reasons must be an
+# engine limitation (e.g. generated columns unsupported) -- adapter bugs get
+# fixed instead, with a spec in spec/.
+
+# Declared-type arguments are dropped: PRAGMA table_info reports varchar(4) as
+# "varchar" and numeric(12,0) as "numeric" (probe: CREATE TABLE a (s varchar(255),
+# d numeric(12,0)); PRAGMA table_xinfo('a') -> types "varchar", "numeric").
+Database schema parser#test_0012_should parse types from the schema properly | engine drops declared-type arguments, so numeric(12,0) parses as :decimal, not :integer
+Database schema parser#test_0016_should parse maximum length for string columns | engine drops declared-type arguments, so varchar(4) has no :max_length
+Sequel::Plugins::AutoValidations#test_0006_should setup max length validations automatically | engine drops declared-type arguments, so String size 50 has no :max_length to validate
+
+# LIKE is always case-insensitive: PRAGMA case_sensitive_like = 1 is accepted
+# but ignored (probe: SELECT 'foo' LIKE 'F%' -> 1 after the pragma; the pragma
+# reads back an empty result).
+Dataset string methods#test_0004_#like should be case sensitive | engine ignores PRAGMA case_sensitive_like; LIKE is case-insensitive
+Dataset string methods#test_0006_#escape_like should escape any metacharacters | engine ignores PRAGMA case_sensitive_like; escaped_like('?', 'Foo_') matches 'foo_'
+Sequel::Plugins::ConstraintValidations::via create_table::with :allow_nil=>false#test_0001_should set up constraints that work even outside the model | engine ignores PRAGMA case_sensitive_like; the like CHECK ('foo%') accepts 'FOOABC'
+Sequel::Plugins::ConstraintValidations::via create_table::with :allow_nil=>true#test_0001_should set up constraints that work even outside the model | engine ignores PRAGMA case_sensitive_like; the like CHECK ('foo%') accepts 'FOOABC'
+Sequel::Plugins::ConstraintValidations::via alter_table::with :allow_nil=>false#test_0001_should set up constraints that work even outside the model | engine ignores PRAGMA case_sensitive_like; the like CHECK ('foo%') accepts 'FOOABC'
+Sequel::Plugins::ConstraintValidations::via alter_table::with :allow_nil=>true#test_0001_should set up constraints that work even outside the model | engine ignores PRAGMA case_sensitive_like; the like CHECK ('foo%') accepts 'FOOABC'
+
+# Other engine gaps.
+Database schema modifiers::views#test_0002_should create views with explicit columns correctly | engine ignores a view's column list when the view selects * (probe: CREATE VIEW v(n) AS SELECT * FROM items; SELECT n FROM v -> "no such column: n")
+Simple dataset operations with nasty table names#test_0001_should work correctly | engine fails AUTOINCREMENT on a table whose name contains '"' (probe: CREATE TABLE `b"m` (id integer PRIMARY KEY AUTOINCREMENT) -> near "m": syntax error; without AUTOINCREMENT it works)

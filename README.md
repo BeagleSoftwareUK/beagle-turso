@@ -47,13 +47,14 @@ that wants local read latency with cloud durability behind it.
 
 ## Packages
 
-This is a monorepo with one shared Rust core wrapped by two Ruby gems:
+This is a monorepo with one shared Rust core wrapped by three Ruby gems:
 
 | Package | Registry | What it is |
 | --- | --- | --- |
 | [`beagle_turso_core`](crates/beagle_turso_core) | [crates.io](https://crates.io/crates/beagle_turso_core) | The Rust sync core — a synchronous façade over the `turso` engine. |
 | [`beagle-turso`](gems/beagle-turso) | [RubyGems](https://rubygems.org/gems/beagle-turso) | The Ruby driver (native extension over the core): open a local or synced database, run SQL, `push`/`pull`. |
 | [`activerecord-beagle-turso`](gems/activerecord-beagle-turso) | [RubyGems](https://rubygems.org/gems/activerecord-beagle-turso) | The ActiveRecord adapter — `adapter: beagle_turso` in `database.yml`. |
+| [`sequel-beagle-turso`](gems/sequel-beagle-turso) | [RubyGems](https://rubygems.org/gems/sequel-beagle-turso) | The Sequel adapter (`beagle-turso://`), for Sequel, ROM and Hanami. |
 
 ## Quick start (Rails)
 
@@ -145,11 +146,12 @@ Three things bite hard enough to call out here, each covered in the
 crates/beagle_turso_core/          # the Rust sync core (published to crates.io)
 gems/beagle-turso/                 # the native-extension driver gem
 gems/activerecord-beagle-turso/    # the ActiveRecord adapter gem
+gems/sequel-beagle-turso/          # the Sequel adapter gem
 docs/                              # the Rails app setup guide and the release runbook
 ```
 
 Releases are cut by tagging `vX.Y.Z`; CI cross-compiles the precompiled gems and
-publishes all three packages via trusted publishing (OIDC, no stored tokens).
+publishes all four packages via trusted publishing (OIDC, no stored tokens).
 See [Releasing](docs/releasing.md) for the checklist, verification and rollback.
 
 ## Status
