@@ -98,10 +98,12 @@ module Sequel
 
       # The driver prefixes engine messages ("query failed: ..."); Sequel's
       # SQLite error regexps (some anchored at \A) expect the bare message.
+      ENGINE_PREFIX = /\A(?:open failed|connect failed|query failed|sync failed|database is busy): /
+
       # Tables the Turso sync engine creates on a synced replica; never user tables.
       SYNC_ENGINE_TABLES = %w[turso_cdc turso_cdc_version turso_sync_last_change_id].freeze
 
-      ENGINE_PREFIX = /\A(?:open failed|connect failed|query failed|sync failed|database is busy): /
+      RETURNING_CLAUSE = /\bRETURNING\b/i
 
       set_adapter_scheme :beagle_turso
       # The URL form: URI schemes can't contain "_" (see adapters/beagle-turso.rb).
@@ -167,10 +169,27 @@ module Sequel
         nil
       end
 
+      # Returns the rowid of the last row inserted, or nil if none was.
+      #
+      # Not conn.last_insert_rowid: on a replica in MVCC journal mode with
+      # change data capture on (every synced replica of a --tursodb remote)
+      # the engine leaves the CDC change id there, so it is wrong
+      # (tursodatabase/turso#9551). INSERT ... RETURNING is correct, so the
+      # statement gets RETURNING rowid appended. rowid always exists: the
+      # engine has no WITHOUT ROWID tables. Several rows (INSERT ... SELECT,
+      # multi-row VALUES) return the last one, like SQLite's
+      # last_insert_rowid; an insert that changed nothing (OR IGNORE, ON
+      # CONFLICT DO NOTHING) returns nil. The logged SQL is the original. RETURNING
+      # goes on its own line so a trailing -- comment (sql_comments) can't swallow it.
+      #
+      # An insert that already has RETURNING is run as is, and its first
+      # column in the last row is the result. (Dataset#insert sends those
+      # through fetch, and insert_select too, not through here.)
       def execute_insert(sql, opts = OPTS)
+        run_sql = RETURNING_CLAUSE.match?(sql) ? sql : "#{sql.sub(/[\s;]+\z/, '')}\nRETURNING rowid"
         _execute(sql, opts) do |conn|
-          conn.execute(sql, [])
-          conn.last_insert_rowid
+          _, _, rows = conn.query_result_with_types(run_sql, [])
+          rows.last&.first
         end
       end
 
@@ -196,6 +215,12 @@ module Sequel
           raise unless drop_self_referencing_table(name, opts)
         end
         nil
+      end
+
+      # Refused on a synced replica, see refuse_rename_when_synced.
+      def rename_table(name, new_name)
+        refuse_rename_when_synced("rename_table")
+        super
       end
 
       # Sequel's check sends SELECT NULL through connection_execute_method
@@ -434,6 +459,7 @@ module Sequel
       # copy, drop the original, and rename the new table into place: nothing
       # refers to the backup name, so the rename rewrites nothing else.
       def duplicate_table(table, opts = OPTS)
+        refuse_rename_when_synced("Rebuilding a table (this alter_table operation)")
         rename, create, insert, drop, *rest = super
         qt = quote_schema_table(table)
         bt = drop.to_s.delete_prefix("DROP TABLE ")
@@ -460,6 +486,24 @@ module Sequel
           name = name.to_s
           name.start_with?("__turso_internal_") || SYNC_ENGINE_TABLES.include?(name)
         end
+      end
+
+      # The engine doesn't capture ALTER TABLE ... RENAME TO / RENAME COLUMN
+      # for sync (turso_core translate/alter.rs emits no CDC for them), so on
+      # a synced replica the remote never sees the rename and every later
+      # write to the table is lost on push.
+      def refuse_rename_when_synced(what)
+        return unless @turso_database.synced?
+
+        raise Error, "#{what} is refused on a synced replica: the Turso sync engine does not replicate " \
+          "ALTER TABLE ... RENAME TO / RENAME COLUMN to the remote, so later writes to the table would be " \
+          "lost on push (no upstream fix yet). Create the new table, copy the rows and drop the old one, " \
+          "or run the rename against the remote database directly."
+      end
+
+      def alter_table_sql(table, op)
+        refuse_rename_when_synced("alter_table rename_column") if op[:op] == :rename_column
+        super
       end
 
       def support_without_rowid?
