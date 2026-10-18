@@ -21,43 +21,59 @@ RSpec.describe "beagle_turso adapter: synced replica guards" do
   # A local connection that behaves as a synced replica for the guards, without
   # a remote: Client#synced? is the single switch the adapter consults.
   def pretend_synced(conn)
-    allow(conn.raw_connection).to receive(:synced?).and_return(true)
+    allow(conn).to receive(:synced_replica?).and_return(true)
     conn
   end
 
   describe "renames (engine bug C)" do
-    it "refuses rename_table and rename_column on a synced replica, and does not run them" do
+    it "refuses rename_table and raw ALTER TABLE ... RENAME on a synced replica, and does not run them" do
       conn = connect
       conn.create_table(:widgets) { |t| t.string :name }
       pretend_synced(conn)
 
       expect { conn.rename_table(:widgets, :gadgets) }
         .to raise_error(bt::UnsupportedOnSyncedReplica, /rename_table.*synced replica.*copy the data/m)
-      expect { conn.rename_column(:widgets, :name, :title) }
-        .to raise_error(bt::UnsupportedOnSyncedReplica, /rename_column/)
       expect { conn.execute("ALTER TABLE widgets RENAME TO gadgets") }.to raise_error(bt::UnsupportedOnSyncedReplica)
       expect { conn.execute(%(/*app*/ ALTER TABLE "widgets" RENAME COLUMN name TO title)) }
         .to raise_error(bt::UnsupportedOnSyncedReplica)
+      expect { conn.execute(%(ALTER TABLE "my widgets" RENAME TO gadgets)) }
+        .to raise_error(bt::UnsupportedOnSyncedReplica)
       expect(conn.tables).to include("widgets")
-      expect(conn.columns(:widgets).map(&:name)).to include("name")
       expect(bt::UnsupportedOnSyncedReplica.ancestors).to include(ActiveRecord::ActiveRecordError)
     end
 
-    it "refuses even when the adapter has not connected yet (lazy connect)" do
-      allow_any_instance_of(ActiveRecord::ConnectionAdapters::BeagleTursoAdapter::Client)
-        .to receive(:synced?).and_return(true)
+    it "allows rename_column (copy-table in Rails 8.1) on a synced replica" do
+      conn = pretend_synced(connect)
+      conn.create_table(:widgets) { |t| t.string :name }
+      expect { conn.rename_column(:widgets, :name, :title) }.not_to raise_error
+      expect(conn.columns(:widgets).map(&:name)).to include("title")
+    end
+
+    it "decides synced-ness from config without connecting or disturbing lazy transactions" do
       conn = connect
+      expect(conn.synced_replica?).to be(false)
       expect(conn.instance_variable_get(:@raw_connection)).to be_nil
-      expect { conn.rename_table(:widgets, :gadgets) }.to raise_error(bt::UnsupportedOnSyncedReplica)
+      conn.create_table(:widgets) { |t| t.string :name }
+      conn.insert("INSERT INTO widgets (name) VALUES ('a')")
+      log = []
+      sub = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, p| log << p[:sql] }
+      ActiveRecord::Base.transaction {}
+      ActiveSupport::Notifications.unsubscribe(sub)
+      expect(log).to eq([])
+    end
+
+    it "treats a config as synced only with remote_url and auth_token" do
+      klass = ActiveRecord::ConnectionAdapters::BeagleTursoAdapter
+      expect(klass.synced_config?(remote_url: "libsql://x", auth_token: "t")).to be(true)
+      expect(klass.synced_config?(remote_url: "libsql://x")).to be(false)
+      expect(klass.synced_config?(database: "x")).to be(false)
     end
 
     it "leaves renames working on a local-only connection" do
       conn = connect
       conn.create_table(:widgets) { |t| t.string :name }
-      conn.rename_column(:widgets, :name, :title)
       conn.rename_table(:widgets, :gadgets)
       expect(conn.tables).to include("gadgets")
-      expect(conn.columns(:gadgets).map(&:name)).to include("title")
     end
 
     it "does not treat rename-looking text in data as a rename" do
@@ -124,6 +140,34 @@ RSpec.describe "beagle_turso adapter: synced replica guards" do
       expect(klass.create!(v: "n").id).to eq(6)
     end
 
+    it "rewrites around trailing comments and semicolons, and ignores 'returning' inside data" do
+      conn = mvcc_cdc_connection(insert_returning_rowid: true)
+      expect(conn.insert("INSERT INTO plain (v) VALUES ('a') -- trailing comment")).to eq(1)
+      expect(conn.insert("INSERT INTO plain (v) VALUES ('b'); /* tag */")).to eq(2)
+      expect(conn.insert("INSERT INTO plain (v) VALUES ('RETURNING') /* returning */")).to eq(3)
+      expect(conn.insert(%(INSERT INTO plain (v) VALUES ('x') -- returning\n))).to eq(4)
+      expect(conn.insert("/* returning */ INSERT INTO plain (v) VALUES ('c')")).to eq(5)
+      expect(conn.select_values("SELECT v FROM plain")).to include("RETURNING")
+    end
+
+    it "rewrites WITH ... INSERT" do
+      conn = mvcc_cdc_connection(insert_returning_rowid: true)
+      id = conn.insert("WITH src(x) AS (SELECT 'w') INSERT INTO plain (v) SELECT x FROM src")
+      expect(id).to eq(1)
+    end
+
+    it "leaves an existing RETURNING clause alone (and the word inside data is not one)" do
+      conn = mvcc_cdc_connection(insert_returning_rowid: true)
+      rows = conn.exec_query("INSERT INTO plain (v) VALUES ('returning') RETURNING v").rows
+      expect(rows).to eq([["returning"]])
+    end
+
+    it "casts string booleans from database.yml / DATABASE_URL" do
+      expect(mvcc_cdc_connection(insert_returning_rowid: "false").send(:insert_returning_rowid?)).to be(false)
+      ActiveRecord::Base.remove_connection
+      expect(connect(database: @path, insert_returning_rowid: "true").send(:insert_returning_rowid?)).to be(true)
+    end
+
     it "defaults on for synced replicas and off for local connections" do
       conn = connect
       expect(conn.send(:insert_returning_rowid?)).to be(false)
@@ -137,21 +181,33 @@ RSpec.describe "beagle_turso adapter: synced replica guards" do
     let(:app) { Rake::Application.new }
     let(:events) { [] }
     let(:conn) { double("connection") }
+    let(:config) do
+      double("db_config", name: "primary",
+        configuration_hash: { adapter: "beagle_turso", database: "/x/r.db", remote_url: "libsql://x", auth_token: "t" })
+    end
+    let(:pending) { true }
+    let(:exists) { true }
+
+    def seen = events.map(&:to_s)
 
     before(:each) do
       push_mod.install!
       @old_app = Rake.application
       Rake.application = app
       ev = events
-      Rake::Task.define_task("db:migrate") { ev << :migrate }
-      Rake::Task.define_task("db:prepare") { ev << :prepare }
+      %w[db:migrate db:prepare db:rollback db:migrate:primary db:rollback:primary db:migrate:up:primary
+         db:migrate:other db:schema:load:primary db:seed].each do |n|
+        Rake::Task.define_task(n) { ev << n }
+      end
       Rake::Task.define_task("db:migrate:redo") do
-        ev << :redo
+        ev << "redo"
         Rake::Task["db:migrate"].invoke
       end
-      Rake::Task.define_task("db:seed") { ev << :seed }
-      allow(push_mod).to receive(:synced_connection).and_return(conn)
-      allow(::Beagle::Turso::SyncManager).to receive(:push!) { ev << :push }
+      allow(push_mod).to receive(:primary_config).and_return(config)
+      allow(push_mod).to receive(:local_database_exists?).and_return(exists)
+      allow(push_mod).to receive(:migration_pending?).and_return(pending)
+      allow(push_mod).to receive(:connection).and_return(conn)
+      allow(::Beagle::Turso::SyncManager).to receive(:push!) { ev << "push" }
       @env = ENV.delete(push_mod::SKIP_ENV)
     end
 
@@ -160,47 +216,117 @@ RSpec.describe "beagle_turso adapter: synced replica guards" do
       ENV[push_mod::SKIP_ENV] = @env if @env
     end
 
-    it "pushes before and after db:migrate and db:prepare" do
+    it "pushes before and after db:migrate and db:prepare when a migration is pending" do
       Rake::Task["db:migrate"].invoke
       Rake::Task["db:prepare"].invoke
-      expect(events).to eq(%i[push migrate push push prepare push])
+      expect(seen).to eq(%w[push db:migrate push push db:prepare push])
     end
 
     it "pushes once around a nested task (redo -> migrate)" do
       Rake::Task["db:migrate:redo"].invoke
-      expect(events).to eq(%i[push redo migrate push])
+      expect(seen).to eq(%w[push redo db:migrate push])
+    end
+
+    it "guards the multi-database tasks namespaced with the PRIMARY config name only" do
+      %w[db:migrate:primary db:rollback:primary db:migrate:up:primary db:schema:load:primary].each do |t|
+        events.clear
+        Rake::Task[t].invoke
+        expect(seen).to eq(["push", t, "push"]), t
+      end
+      events.clear
+      Rake::Task["db:migrate:other"].invoke
+      expect(seen).to eq(["db:migrate:other"])
+    end
+
+    it "derives the suffix from the config, not a hard-coded 'primary'" do
+      allow(config).to receive(:name).and_return("other")
+      Rake::Task["db:migrate:other"].invoke
+      expect(seen).to eq(%w[push db:migrate:other push])
+      events.clear
+      Rake::Task["db:migrate:primary"].invoke
+      expect(seen).to eq(["db:migrate:primary"])
     end
 
     it "does not touch unrelated tasks" do
       Rake::Task["db:seed"].invoke
-      expect(events).to eq([:seed])
+      expect(seen).to eq(["db:seed"])
     end
 
-    it "aborts before migrating, with a redacted message, when the pre-push fails" do
-      allow(::Beagle::Turso::SyncManager).to receive(:push!).and_raise(RuntimeError, "boom https://user@secret.example/db?authToken=abc")
-      expect { Rake::Task["db:migrate"].invoke }
-        .to raise_error(bt::MigrationPushError, /could not push pending writes to Turso before migrating \(RuntimeError: .*BEAGLE_TURSO_SKIP_MIGRATION_PUSH=1 to migrate anyway/m)
+    context "with nothing pending" do
+      let(:pending) { false }
+
+      it "does no push at all for db:prepare and db:migrate, even if Turso is down" do
+        allow(::Beagle::Turso::SyncManager).to receive(:push!).and_raise("Turso is down")
+        Rake::Task["db:prepare"].invoke
+        Rake::Task["db:migrate"].invoke
+        expect(seen).to eq(%w[db:prepare db:migrate])
+      end
+
+      it "still pushes around explicit rollbacks" do
+        Rake::Task["db:rollback"].invoke
+        expect(seen).to eq(%w[push db:rollback push])
+      end
+    end
+
+    context "when the replica does not exist yet (fresh database)" do
+      let(:exists) { false }
+
+      it "skips the pre-push (nothing local) and pushes after" do
+        Rake::Task["db:prepare"].invoke
+        expect(seen).to eq(%w[db:prepare push])
+      end
+    end
+
+    it "aborts before migrating, with a redacted message and no cause, when the pre-push fails" do
+      allow(::Beagle::Turso::SyncManager).to receive(:push!).and_raise(RuntimeError, "boom libsql://user@secret.example/db?authToken=abc")
+      expect { Rake::Task["db:migrate"].invoke }.to raise_error(bt::MigrationPushError) { |e|
+        expect(e.message).to match(/could not push pending writes to Turso before migrating \(RuntimeError: .*BEAGLE_TURSO_SKIP_MIGRATION_PUSH=1 to migrate anyway/m)
+        expect(e.message).not_to include("authToken=abc")
+        expect(e.cause).to be_nil
+      }
       expect(events).to eq([])
     end
 
-    it "fails with a clear message when the post-push fails (schema applied locally)" do
+    it "words an OpenError as failing to open the synced replica" do
+      open_error = Class.new(StandardError) { def self.name = "Beagle::Turso::OpenError" }
+      allow(::Beagle::Turso::SyncManager).to receive(:push!).and_raise(open_error, "nope")
+      expect { Rake::Task["db:migrate"].invoke }.to raise_error(bt::MigrationPushError, /could not open the synced replica: nope/)
+    end
+
+    it "retries the post-push once: a spurious first failure only warns" do
       calls = 0
-      allow(::Beagle::Turso::SyncManager).to receive(:push!) { (calls += 1) == 2 ? raise("net down") : events << :push }
-      expect { Rake::Task["db:migrate"].invoke }
-        .to raise_error(bt::MigrationPushError, /applied to the local replica but could not be pushed.*net down/m)
-      expect(events).to eq(%i[push migrate])
+      allow(::Beagle::Turso::SyncManager).to receive(:push!) do
+        calls += 1
+        events << "push"
+        raise "near RP, None" if calls == 2
+      end
+      expect { Rake::Task["db:migrate"].invoke }.to output(/failed once \(RuntimeError: near RP, None\).*succeeded on retry/m).to_stderr
+      expect(seen).to eq(%w[push db:migrate push push])
+    end
+
+    it "fails with an accurate message when the retry also fails" do
+      calls = 0
+      allow(::Beagle::Turso::SyncManager).to receive(:push!) do
+        calls += 1
+        events << "push"
+        raise "net down" if calls > 1
+      end
+      expect { Rake::Task["db:migrate"].invoke }.to raise_error(bt::MigrationPushError) { |e|
+        expect(e.message).to match(/applied to the local replica.*failed twice.*net down.*net down.*check sync/m)
+        expect(e.cause).to be_nil
+      }
     end
 
     it "continues with a loud warning, and no push, when BEAGLE_TURSO_SKIP_MIGRATION_PUSH=1" do
       ENV[push_mod::SKIP_ENV] = "1"
       expect { Rake::Task["db:migrate"].invoke }.to output(/WARNING.*SKIP_MIGRATION_PUSH=1.*may be lost/m).to_stderr
-      expect(events).to eq([:migrate])
+      expect(seen).to eq(["db:migrate"])
     end
 
     it "is a no-op for local-only connections" do
-      allow(push_mod).to receive(:synced_connection).and_return(nil)
+      allow(config).to receive(:configuration_hash).and_return(adapter: "beagle_turso", database: "x.db")
       Rake::Task["db:migrate"].invoke
-      expect(events).to eq([:migrate])
+      expect(seen).to eq(["db:migrate"])
     end
 
     it "treats only beagle_turso configs with remote_url and auth_token as synced" do
@@ -209,10 +335,11 @@ RSpec.describe "beagle_turso adapter: synced replica guards" do
       expect(push_mod.synced_config?(adapter: "sqlite3", remote_url: "libsql://x", auth_token: "t")).to be(false)
     end
 
-    it "resolves to nil for a local-only primary config" do
-      allow(push_mod).to receive(:synced_connection).and_call_original
-      ActiveRecord::Base.configurations = { (ENV["RAILS_ENV"] || "development") => { adapter: "beagle_turso", database: ":memory:" } }
-      expect(push_mod.synced_connection).to be_nil
+    it "answers the pending check from the real migration context" do
+      allow(push_mod).to receive(:migration_pending?).and_call_original
+      allow(push_mod).to receive(:connection).and_call_original
+      ActiveRecord::Base.establish_connection(adapter: "beagle_turso", database: ":memory:")
+      expect(push_mod.send(:migration_pending?)).to be(false)
     end
   end
 end
