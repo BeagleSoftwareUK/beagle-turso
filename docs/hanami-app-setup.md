@@ -31,7 +31,7 @@ group :test do
 end
 ```
 
-All the gems are precompiled; no Rust toolchain is needed.
+The gems are precompiled for common platforms; on others they need a Rust toolchain.
 
 `async` 2.25 or newer is what lets a push or pull run off the Falcon reactor
 (see [Falcon](#7-falcon)). That needs Ruby 4.0. On 3.3 and 3.4 the GVL is
@@ -56,8 +56,8 @@ turso db tokens create myapp-dev
 ```
 
 Keep the variables out of git. Hanami's convention is to commit `.env` and keep
-secrets in `.env.local` (gitignored, loaded by `dotenv` in development and
-test); use that.
+secrets in `.env.local` (gitignored). Hanami 3 loads `.env.local` in every
+environment except test, via `dotenv` (development and test group only); use that.
 
 ```sh
 # .env            (committed)
@@ -66,13 +66,19 @@ DATABASE_URL=beagle-turso://db/app.db
 # .env.test       (committed)
 DATABASE_URL=beagle-turso://db/app_test.db
 
-# .env.local      (NOT committed: development, and your production secret store)
+# .env.local      (NOT committed: development only)
 TURSO_DATABASE_URL=libsql://<db>-<org>.turso.io
 TURSO_AUTH_TOKEN=<token>
 ```
 
 Names: `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`, the same as the adapter READMEs.
 Dev and test can run without them as a plain local file.
+
+**Production loads no `.env` file** (`dotenv` is in the development and test
+group). Set `DATABASE_URL`, `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in the
+real environment or your secret store. If one is missing, `ENV.fetch` raises at
+boot, which under Falcon shows up only as the worker restart loop described in
+[section 6](#6-the-turso_sync-provider).
 
 ### Optional: refuse to boot against the wrong database
 
@@ -110,7 +116,7 @@ Sequel.extension :fiber_concurrency
 Hanami.app.configure_provider :db do
   config.gateway :default do |gw|
     gw.database_url = ENV.fetch("DATABASE_URL")
-    # Test env never syncs, even if .env.local credentials are present.
+    # Test env never syncs, even if credentials are exported in the shell or CI.
     remote = !Hanami.env?(:test) && ENV["TURSO_DATABASE_URL"].to_s != ""
     if remote
       # Optional: refuse to sync with another app's or environment's database.
@@ -138,9 +144,10 @@ What each piece is for:
   every request in a fiber on one thread. Without the extension the pool hands
   every fiber on the thread the same connection, so concurrent requests share
   one connection and its transaction state.
-- **The test-env guard.** A developer who has credentials in `.env.local` would
-  otherwise run the test suite against a synced replica, writing test rows to
-  Turso Cloud. Tests are always local-only.
+- **The test-env guard.** `.env.local` is not loaded in test, but variables
+  exported in the shell or CI, or an `.env.test.local` file, are. Without the
+  guard a test run with those present uses a synced replica and writes test
+  rows to Turso Cloud. Tests are always local-only.
 - **`before(:stop)` uses `registered?`, not `key?`.** `key?` loads the provider
   lazily, which raises ("can't add a new key into hash during iteration") when
   Hanami shuts down in prepared mode.
@@ -298,10 +305,13 @@ matters when you write a migration:
 - **What a rebuild loses:** triggers on the table, partial indexes, a column's
   `COLLATE`, a foreign key's `DEFERRABLE`, and the `AUTOINCREMENT` counter
   (it restarts from the current max id, so a deleted top id can be reused).
-  Re-create them in the same migration.
+  Re-create them in the same migration. A rebuild also fails, and rolls back
+  cleanly, if another table's trigger references the rebuilt table.
 - **Renaming a column that another table's foreign key references is
   refused.** Rebuild the referencing table as well, or apply the rename on
   the remote and pull. Dropping a foreign key column drops that foreign key.
+- **Dropping a self-referencing table that has rows** works only outside a
+  transaction (the adapter retries with foreign keys off); inside one it raises.
 - **After an unexpected push error, don't pull.** Local writes that never
   reached the remote are the only copy, and a pull can discard them. Copy the
   replica file and all of its sidecar files somewhere safe first, then work out
@@ -386,8 +396,8 @@ end
 # One process owns the replica; Async's worker pool lets push/pull run off the reactor.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# Falcon only waits 1 s by default for the worker to stop; the final push needs longer on a slow link.
 export ASYNC_SCHEDULER_WORKER_POOL=true
+# --graceful-stop: Falcon only waits 1 s by default for the worker to stop; the final push needs longer on a slow link.
 exec bundle exec falcon serve --count 1 --graceful-stop "${GRACEFUL_STOP:-10}" --bind "http://localhost:${PORT:-2300}" "$@"
 ```
 
@@ -449,13 +459,23 @@ module YourApp
           rescue StandardError
             false
           end
-          syncer = Hanami.app.key?("turso_sync.syncer") ? Hanami.app["turso_sync.syncer"] : nil
+          syncer = Hanami.app.registered?("turso_sync.syncer") ? Hanami.app["turso_sync.syncer"] : nil
           sync = syncer && syncer.status.to_h.transform_values { |v| v.is_a?(Time) ? v.iso8601 : v }
           response.format = :json
           response.body = JSON.generate(process: "ok", database: db_ok ? "ok" : "error", sync: sync)
         end
       end
     end
+  end
+end
+```
+
+```ruby
+# app/actions/ping/show.rb (inside YourApp::Actions::Ping)
+class Show < YourApp::Action
+  def handle(_request, response)
+    response.content_type = "text/plain; charset=utf-8"
+    response.body = "pong"
   end
 end
 ```
@@ -468,7 +488,8 @@ get "/health", to: "health.show"  # process, database, and sync status
 
 `sync` is `null` on a local-only replica. Otherwise it carries `running`,
 `last_push_at`, `last_pull_at` and `consecutive_failures`, plus the last error
-class and time. Error messages are stripped of URLs and tokens.
+class and time (`last_error_message` included). Error messages are stripped of
+URLs and tokens, but they still leak internals: don't make `/health` public.
 
 ## 9. Testing: DatabaseCleaner with `:truncation`
 
@@ -535,7 +556,12 @@ end
   failure is nasty. Tests run local-only (section 4), where this does not arise,
   but the same suite can be pointed at a synced replica by mistake.
 - Run specs with `HANAMI_ENV=test`. An empty `HANAMI_ENV` boots development, with
-  a synced replica; have `spec_helper.rb` abort in that case.
+  a synced replica, so `spec_helper.rb` defaults it and aborts otherwise:
+
+  ```ruby
+  ENV["HANAMI_ENV"] = "test" if ENV["HANAMI_ENV"].to_s.empty?
+  abort "spec_helper: HANAMI_ENV must be \"test\" for specs (got #{ENV["HANAMI_ENV"].inspect})" unless ENV["HANAMI_ENV"] == "test"
+  ```
 - The test database is not migrated for you: run `HANAMI_ENV=test bin/migrate`
   once.
 
@@ -681,14 +707,14 @@ hardware and networks.
 | What | Result |
 |---|---|
 | Baseline `/ping` p99 | 5 to 10 ms (swings with the load generator's CPU use) |
-| Push of about 5,000 rows (19 s, 30 s, 120 s) | `/ping` p99 6.4, 9.5, 20.0 ms vs 6.4, 8.9, 17.2 ms quiet; max 45 ms |
+| Push of about 5,000 rows (30 s, 19 s, 120 s, in run order) | `/ping` p99 6.4, 9.5, 20.0 ms vs 6.4, 8.9, 17.2 ms quiet; max 45 ms |
 | Single-row write 1 s into an 18 to 67 s push | committed in 23 to 32 ms; `/ping` at baseline apart from one ~30 ms blip |
-| Slow query (3,000,000-row recursive CTE) | `/ping` stalled for the whole query: 4.6, 4.95, 5.2 s |
+| Slow query (3,000,000-row recursive CTE) | `/ping` stalled for the whole query: 4.64, 4.95, 5.21 s |
 | Bulk insert, 2,000 rows in one transaction (50 per statement) | 2.7 s stall in the one run that survived; the other two were killed (below) |
 
 What this says:
 
-- **A push does not block reads, or a concurrent write.** The driver releases the
+- **A push does not block reads, or a concurrent write** (at least for an explicit push). The driver releases the
   GVL for `push` and `pull`, and with `ASYNC_SCHEDULER_WORKER_POOL=true`
   they run off the reactor. Push duration is dominated by the network and
   varies a lot (19 to 120 s for the same 5,000 rows; pushing the 5,000 deletes
@@ -703,14 +729,21 @@ What this says:
   grew. A single 5,000-row transaction froze the reactor past Falcon's health
   check every time.
 - **Occasional freezes of more than 30 s on the first statement after
-  `BEGIN IMMEDIATE`**, mostly after a large delete-and-push cycle. About
-  eight times Falcon's health check (30 s by default) killed the worker
-  (`Health check failed!`, `SIGKILL`). The cause is **not isolated yet**:
-  it needs engine-level tracing. They did not happen in the three
-  write-during-push runs.
+  `BEGIN IMMEDIATE`**, mostly after a large delete-and-push cycle. Falcon's
+  health check (30 s by default) killed the worker about eight times
+  (`Health check failed!`, `SIGKILL`). They also happened several times with the
+  background syncer at its 5 s and 290 s intervals, where a push or pull was in
+  flight at the time of the write. They did not happen in the three
+  write-during-push runs from an explicit push. The cause is **not isolated
+  yet**: it needs engine-level tracing. Until then, with the default 5 s syncer
+  interval, expect that a large write can freeze the process.
+- **Looking ahead.** `beagle-turso` 0.4.0 is planned to run statements off the
+  reactor, so a long statement stops freezing the server. Not released yet.
 
 Practical advice:
 
+- With the default 5 s syncer interval, expect that a large write can freeze the
+  process; the advice below limits how often and for how long.
 - Keep transactions small. Chunk big writes (a few hundred rows per
   transaction) so each stall is short, and do large backfills offline: against
   a copy of the database, or with the server stopped, then push.
