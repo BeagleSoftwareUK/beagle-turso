@@ -63,13 +63,23 @@ and `bootstrap_if_empty:` (passed to the driver).
 ## Hanami and ROM
 
 ```ruby
+# config/providers/db.rb
+require "sequel"
+Sequel.extension :fiber_concurrency   # before the first connection (Falcon)
+
 Hanami.app.configure_provider :db do
   config.gateway(:default) do |gw|
     gw.database_url = "beagle-turso://#{Hanami.app.root.join("db/app.db")}"
-    gw.connection_options(remote_url: ENV["TURSO_DATABASE_URL"], auth_token: ENV["TURSO_AUTH_TOKEN"])
+    # Never sync in the test env, even if credentials are in the environment.
+    if !Hanami.env?(:test) && ENV["TURSO_DATABASE_URL"].to_s != ""
+      gw.connection_options(remote_url: ENV.fetch("TURSO_DATABASE_URL"), auth_token: ENV.fetch("TURSO_AUTH_TOKEN"))
+    end
   end
 end
 ```
+
+The [Hanami + Falcon setup guide](../../docs/hanami-app-setup.md) covers the
+rest: the sync provider, `bin/migrate`, shutdown, Falcon flags and testing.
 
 - ROM's gateway keeps its own copy of the connection options. The adapter
   scrubs the token from the `Database` it builds, but not from that copy, so

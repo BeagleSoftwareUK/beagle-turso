@@ -87,17 +87,23 @@ Merge to `master`.
 
 ## 2. Trusted publishers (one-time setup)
 
-These are already set up for the three packages released so far
-(`beagle_turso_core`, `beagle-turso` and `activerecord-beagle-turso`).
-`sequel-beagle-turso` needs a **pending publisher on RubyGems before its first
-release**, set up as described below, or its first push will fail. Revisit this
-section only when **adding a new package**, such as a new gem:
+These are set up for all four packages. Revisit this section only when
+**adding a new package**, such as a new gem:
 
-- **RubyGems** (rubygems.org → profile → Trusted Publishers → GitHub
-  Actions): add a **pending** publisher for the new gem name. Use repository
-  `BeagleSoftwareUK/beagle-turso`, workflow `release.yml`, and leave the
-  environment blank. A pending publisher is what lets the first publish of a
-  brand-new gem go out over OIDC.
+- **RubyGems:** push the new gem's **first version by hand**, then attach the
+  publisher. A pending publisher does not work here. For `sequel-beagle-turso`
+  0.1.0, the release job's OIDC key covered only the gems that already had
+  this publisher, and the push was refused with "You are not allowed to push
+  this gem".
+  1. Let the release run build the gem, then download it with
+     `gh run download <run-id>`. In that run, `publish-gems` fails on the new
+     gem only.
+  2. Push it with your own account: `gem push <name>-X.Y.Z.gem`.
+  3. On the gem's page, open **Trusted publishers → Create → GitHub Actions**.
+     Use repository `BeagleSoftwareUK/beagle-turso`, workflow `release.yml`,
+     and leave the environment blank.
+  4. Re-run the failed job: `gh run rerun <run-id> --failed`. It skips the
+     versions that are already published and goes green.
 - **crates.io**: in the crate's settings, under Trusted Publishing, use the
   same repository and workflow. If crates.io requires the crate to exist
   before a publisher can be attached, publish once with a short-lived token
