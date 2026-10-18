@@ -68,7 +68,10 @@ does not cover them automatically. Source them from encrypted credentials or
 transaction to finish before raising `Beagle::Turso::BusyError`. Transactions
 begin with `BEGIN IMMEDIATE`, so a writer waits at `BEGIN`, never part-way
 through. The wait sleeps in Ruby, so other threads and fibers keep running.
-Without `timeout:` (or with 0), a busy write raises at once.
+Opening a new connection waits the same way when a synced replica is busy
+with a sync (the engine reports "database tape error: database is busy" as an
+`OpenError` or `ConnectError`), so a pool growing during a `SyncJob` no
+longer fails. Without `timeout:` (or with 0), both raise at once.
 
 An optional `bootstrap_if_empty:` (default `true`) controls whether a brand
 new/empty local file is populated from the remote on first open — see
