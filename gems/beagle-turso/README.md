@@ -125,8 +125,17 @@ still a `RuntimeError`. A replica file already held by another process raises
 - One `Database` may be shared by threads. Give each thread its own
   `Connection`; a shared `Connection` works but serializes its callers.
 - `open`, `connect`, `push` and `pull` release the GVL, so other threads keep
-  running while they wait on the network. Queries keep it; they are local and
-  fast.
+  running while they wait on the network.
+- Statements (`execute`, `query`, `query_result`, `query_result_with_types`,
+  `execute_batch`) also release the GVL, so a long query or bulk import doesn't
+  stop other threads. Statements on one `Database` still run one at a time,
+  across all its connections, as they did under the GVL: a statement waits for
+  the one in flight, never for a whole transaction or import.
+- To keep statements under the GVL (the 0.3.0 behaviour), set
+  `BEAGLE_TURSO_STATEMENT_GVL=hold` (read once, when the gem loads) or call
+  `Beagle::Turso.statement_gvl = :hold`; `:release` is the default.
+  `Beagle::Turso.statement_gvl` returns the current mode. The setting is
+  process-wide.
 - While one thread pushes, `closed?` returns immediately on other threads, and
   queries on other connections proceed.
 - On a synced database, `connect` called while another thread is pushing waits
@@ -136,14 +145,16 @@ still a `RuntimeError`. A replica file already held by another process raises
   request.
 - `close` during an in-flight `push` is safe: the push finishes or raises, and
   later calls raise `ClosedError`.
-- A blocked native call cannot be interrupted: `Timeout` and `Thread#kill`
-  take effect when it returns.
+- A blocked native call, including a long statement, cannot be interrupted:
+  `Timeout` and `Thread#kill` take effect when it returns.
 - **Falcon / Async:** on Ruby 4.0+ with `async` 2.25+ (enable its worker pool
   with `ASYNC_SCHEDULER_WORKER_POOL=true` or
   `Async::Scheduler.new(worker_pool: true)`), a fiber scheduler runs these
-  calls on a worker thread, so the reactor keeps serving other requests during
-  a sync. On Ruby 3.3/3.4 the GVL is still released, but the scheduler's own
-  thread blocks. Run sync from a dedicated thread there. Run one Falcon
+  calls and statements on a worker thread, so the reactor keeps serving other
+  requests during a sync or a long statement. A fiber's query waits (off the
+  reactor) for any statement in flight on the same `Database`. On Ruby 3.3/3.4
+  the GVL is still released, but nothing is offloaded: the scheduler's own
+  thread blocks. Run sync and long imports from a dedicated thread there. Run one Falcon
   process per replica (`--count 1`): the replica file is locked to one
   process.
 - **Fork:** handles are bound to the process that opened them. In a forked

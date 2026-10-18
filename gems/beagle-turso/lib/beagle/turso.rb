@@ -15,6 +15,25 @@ end
 
 module Beagle
   module Turso
+    # Whether statements (Connection#execute, #query, #query_result,
+    # #query_result_with_types, #execute_batch) release the GVL: :release (the
+    # default) lets other threads run and a worker-pool fiber scheduler offload
+    # them; :hold keeps them under the GVL, as in 0.3.0. Process-wide.
+    def self.statement_gvl
+      _statement_gvl_hold? ? :hold : :release
+    end
+
+    def self.statement_gvl=(mode)
+      unless mode == :hold || mode == :release
+        raise ArgumentError, "statement_gvl must be :hold or :release"
+      end
+      _set_statement_gvl_hold(mode == :hold)
+    end
+
+    private_class_method :_statement_gvl_hold?, :_set_statement_gvl_hold
+
+    self.statement_gvl = :hold if ENV["BEAGLE_TURSO_STATEMENT_GVL"] == "hold"
+
     class Database
       # Opens a local-only database, or one synced with a remote Turso
       # database when both `remote_url` and `auth_token` are given (see
