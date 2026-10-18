@@ -186,7 +186,8 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
   - the `AUTOINCREMENT` counter restarts from the current max id, so a deleted
     top id can be reused;
   - partial indexes are not recreated;
-  - a column's `COLLATE` is dropped.
+  - a column's `COLLATE` is dropped;
+  - a foreign key's `DEFERRABLE` is dropped (the engine doesn't report it).
 
   On a synced replica, `rename_column` also keeps the table's own foreign keys
   (re-added with the new column name, self-references included), but it is
