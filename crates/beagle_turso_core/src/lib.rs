@@ -121,12 +121,16 @@ enum Inner {
 /// `Option`; an operation still in flight keeps its own `Arc` and finishes,
 /// and the engine is released when the last one drops. `None` means closed.
 /// `sync_lock` serializes `push`/`pull` against each other only.
+/// `stmt_lock` is shared with every [`Connection`] from this database and is
+/// held for exactly one statement, so statements never overlap within a
+/// database (the engine reports overlapping autocommit writers as busy).
 /// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Database {
     rt: ManuallyDrop<SharedRt>,
     pid: u32,
     inner: Mutex<Option<Arc<Inner>>>,
     sync_lock: Mutex<()>,
+    stmt_lock: Arc<Mutex<()>>,
 }
 
 /// A connection to a [`Database`], used to run SQL.
@@ -134,10 +138,14 @@ pub struct Database {
 /// `conn` is a `Mutex<Option<_>>` for the same reasons as [`Database::inner`]:
 /// [`Connection::close`] can release the handle eagerly, `None` means closed,
 /// and the `Mutex` keeps the type `Send + Sync` for the Magnus wrap.
+/// `stmt_lock` is the owning [`Database`]'s statement lock; `execute`,
+/// `query_result` and `execute_batch` hold it for one statement, always taking
+/// it before `conn`. `last_insert_rowid`, `close` and `is_closed` don't.
 /// Opened handles are bound to the opening process; see [`Error::Forked`].
 pub struct Connection {
     rt: ManuallyDrop<SharedRt>,
     pid: u32,
+    stmt_lock: Arc<Mutex<()>>,
     conn: Mutex<Option<turso::Connection>>,
 }
 
@@ -170,6 +178,7 @@ impl Database {
             pid: std::process::id(),
             inner: Mutex::new(Some(Arc::new(inner))),
             sync_lock: Mutex::new(()),
+            stmt_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -194,6 +203,7 @@ impl Database {
         Ok(Connection {
             rt: ManuallyDrop::new((*self.rt).clone()),
             pid: self.pid,
+            stmt_lock: Arc::clone(&self.stmt_lock),
             conn: Mutex::new(Some(conn)),
         })
     }
@@ -309,6 +319,7 @@ impl Drop for Database {
 impl Connection {
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         check_pid(self.pid)?;
+        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
@@ -329,6 +340,7 @@ impl Connection {
     /// know column identity, not just positional values.
     pub fn query_result(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         check_pid(self.pid)?;
+        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let tparams: Vec<turso::Value> = params.iter().map(Value::to_turso).collect();
@@ -393,6 +405,7 @@ impl Connection {
     /// `INSERT INTO t (n) VALUES ('a;b')`) are handled correctly.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         check_pid(self.pid)?;
+        let _stmt = self.stmt_lock.lock().unwrap_or_else(|p| p.into_inner());
         let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let conn = guard.as_ref().ok_or(Error::Closed)?;
         let result = self.rt.block_on(async {
