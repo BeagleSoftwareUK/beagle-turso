@@ -105,6 +105,10 @@ module Sequel
 
       RETURNING_CLAUSE = /\bRETURNING\b/i
 
+      # String literals, quoted identifiers, and comments: where the word
+      # RETURNING is data, not syntax.
+      NON_CODE = %r{'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|--[^\n]*|/\*.*?\*/}m
+
       set_adapter_scheme :beagle_turso
       # The URL form: URI schemes can't contain "_" (see adapters/beagle-turso.rb).
       Sequel::ADAPTER_MAP[:"beagle-turso"] = self
@@ -185,8 +189,11 @@ module Sequel
       # An insert that already has RETURNING is run as is, and its first
       # column in the last row is the result. (Dataset#insert sends those
       # through fetch, and insert_select too, not through here.)
+      #
+      # Note: insert(select_ds) / INSERT ... SELECT materialises every
+      # returned rowid just to take the last one.
       def execute_insert(sql, opts = OPTS)
-        run_sql = RETURNING_CLAUSE.match?(sql) ? sql : "#{sql.sub(/[\s;]+\z/, '')}\nRETURNING rowid"
+        run_sql = with_returning_rowid(sql)
         _execute(sql, opts) do |conn|
           _, _, rows = conn.query_result_with_types(run_sql, [])
           rows.last&.first
@@ -452,14 +459,14 @@ module Sequel
       end
 
       # Sequel rebuilds a table by renaming it to a backup, creating the new
-      # table, copying and dropping the backup, relying on legacy_alter_table
-      # to stop the rename touching other tables. The engine ignores that
-      # pragma and rewrites their foreign keys (and views) to the backup name,
-      # which is then dropped. So build the new table under the backup name,
-      # copy, drop the original, and rename the new table into place: nothing
-      # refers to the backup name, so the rename rewrites nothing else.
+      # table, copying and dropping the backup. The engine ignores
+      # legacy_alter_table and rewrites other tables' foreign keys (and views)
+      # to the backup name, and on a synced replica a RENAME never reaches the
+      # remote at all. So rebuild without any RENAME: copy the rows to a backup
+      # table made from the new definition, drop the original, recreate it,
+      # copy back, drop the backup. Nothing refers to the backup name. (Used
+      # for every rebuild, local or synced, so there is one code path.)
       def duplicate_table(table, opts = OPTS)
-        refuse_rename_when_synced("Rebuilding a table (this alter_table operation)")
         rename, create, insert, drop, *rest = super
         qt = quote_schema_table(table)
         bt = drop.to_s.delete_prefix("DROP TABLE ")
@@ -471,11 +478,14 @@ module Sequel
         end
 
         columns = insert.delete_prefix(insert_prefix).delete_suffix(" FROM #{bt}")
+        new_cols = columns.split(") SELECT ", 2).first
         [
           "CREATE TABLE #{bt}(#{create.delete_prefix(create_prefix)}",
           "INSERT INTO #{bt}(#{columns} FROM #{qt}",
           "DROP TABLE #{qt}",
-          "ALTER TABLE #{bt} RENAME TO #{qt}",
+          create,
+          "INSERT INTO #{qt}(#{new_cols}) SELECT #{new_cols} FROM #{bt}",
+          "DROP TABLE #{bt}",
           *rest
         ]
       end
@@ -486,6 +496,21 @@ module Sequel
           name = name.to_s
           name.start_with?("__turso_internal_") || SYNC_ENGINE_TABLES.include?(name)
         end
+      end
+
+      # sql with RETURNING rowid added, unless it has a RETURNING clause. The
+      # clause goes at the end of the statement: before a trailing ";" and any
+      # trailing comment (a "--" comment would otherwise swallow it). Literals,
+      # quoted identifiers and comments are masked first, so "RETURNING"
+      # inside data doesn't count as a clause.
+      def with_returning_rowid(sql)
+        # Comments become spaces (they aren't part of the statement), literals
+        # and identifiers become "x" (they are).
+        masked = sql.gsub(NON_CODE) { |m| (m.start_with?("--", "/*") ? " " : "x") * m.length }
+        return sql if RETURNING_CLAUSE.match?(masked)
+
+        at = masked.sub(/;\s*\z/, "").rstrip.length
+        "#{sql[0, at]} RETURNING rowid#{sql[at..]}"
       end
 
       # The engine doesn't capture ALTER TABLE ... RENAME TO / RENAME COLUMN
@@ -502,7 +527,19 @@ module Sequel
       end
 
       def alter_table_sql(table, op)
-        refuse_rename_when_synced("alter_table rename_column") if op[:op] == :rename_column
+        # On a synced replica, native DROP COLUMN loses unpushed rows and
+        # RENAME COLUMN never reaches the remote (the engine doesn't capture
+        # them), so both go through the RENAME-free rebuild.
+        if @turso_database.synced?
+          case op[:op]
+          when :drop_column
+            ocp = lambda { |oc| oc.delete_if { |c| c.to_s == op[:name].to_s } }
+            return duplicate_table(table, old_columns_proc: ocp) { |cols| cols.delete_if { |s| s[:name].to_s == op[:name].to_s } }
+          when :rename_column
+            ncp = lambda { |nc| nc.map! { |c| c.to_s == op[:name].to_s ? op[:new_name] : c } }
+            return duplicate_table(table, new_columns_proc: ncp) { |cols| cols.each { |s| s[:name] = op[:new_name] if s[:name].to_s == op[:name].to_s } }
+          end
+        end
         super
       end
 

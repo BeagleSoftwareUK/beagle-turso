@@ -82,3 +82,32 @@ RSpec.describe "execute_insert RETURNING suffix" do
     db.close_replica
   end
 end
+
+RSpec.describe "execute_insert on a WAL replica" do
+  let(:db) do
+    d = Sequel.connect(adapter: :beagle_turso, database: tmp_db)
+    d.create_table(:t) { primary_key :id; String :v; String :u, unique: true }
+    d
+  end
+  after { db.close_replica }
+
+  it "returns nil for an ignored insert and the updated row's rowid for an upsert" do
+    db[:t].insert(v: "a", u: "k")
+    db[:t].insert(v: "b", u: "m")
+    expect(db[:t].insert_ignore.insert(v: "x", u: "k")).to be_nil
+    expect(db[:t].insert_conflict(target: :u, update: { v: "up" }).insert(v: "x", u: "m")).to eq(2)
+    expect(db[:t].where(u: "m").get(:v)).to eq("up")
+  end
+
+  it "is not fooled by RETURNING inside literals, identifiers or comments" do
+    expect(db[:t].insert(v: "Returning customer")).to eq(1)
+    expect(db[:t].insert(v: "the RETURNING word 'it''s'")).to eq(2)
+    expect(db[:t].insert(v: "x -- RETURNING")).to eq(3)
+    expect(db.execute_insert('INSERT INTO t (v) VALUES (\'a\') /* RETURNING */')).to eq(4)
+    expect(db.execute_insert("INSERT INTO t (v) VALUES ('b'); -- RETURNING\n")).to eq(5)
+    expect(db.execute_insert("INSERT INTO t (v) VALUES ('c') ;  ")).to eq(6)
+    db.create_table(:returning) { primary_key :id; String :"RETURNING" }
+    expect(db[:returning].insert("RETURNING": "z")).to eq(1)
+    expect(db[:t].count).to eq(6)
+  end
+end

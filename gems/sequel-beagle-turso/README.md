@@ -166,16 +166,26 @@ covers the GVL and Falcon notes, including what runs on Ruby 3.3 and 4.0.
   statement and returns the last row's rowid (`nil` if nothing was inserted,
   such as `insert_ignore` hitting a duplicate), so ids are correct everywhere.
   Code that calls the driver's `last_insert_rowid` itself is still affected.
-- **Renames are refused on synced replicas.** The sync engine doesn't capture
-  `ALTER TABLE ... RENAME TO` or `RENAME COLUMN` for sync, so the remote never
-  sees the rename and later writes to the table are lost on push. When
-  `turso_database.synced?`, `rename_table`, `alter_table { rename_column }` and
-  the `alter_table` operations that rebuild a table (`set_column_type`,
-  `set_column_allow_null`, `set_column_default`, constraint changes, adding a
-  unique or primary key column and so on, which end in a rename) raise
-  `Sequel::Error`. Local-only replicas are unaffected. Workaround: create the
-  new table, copy the rows and drop the old one, or run the rename against the
-  remote database directly.
+- **`rename_table` is refused on synced replicas.** The sync engine doesn't
+  capture `ALTER TABLE ... RENAME TO` or `RENAME COLUMN` for sync, so the remote
+  never sees the rename and later writes to the table are lost on push. When
+  `turso_database.synced?`, `rename_table` raises `Sequel::Error`. Local-only
+  replicas are unaffected. Workaround: create the new table, copy the rows and
+  drop the old one, or run the rename against the remote database directly.
+- **Table rebuilds avoid `RENAME`.** Operations that rebuild a table
+  (`set_column_type`, `set_column_allow_null`, `set_column_default`, constraint
+  changes, adding a unique column) copy the rows to a backup table, drop and
+  recreate the table, copy back and drop the backup, so nothing is renamed. On
+  a synced replica `drop_column` and `rename_column` go through the same
+  rebuild too (the native `DROP COLUMN` loses unpushed rows, and
+  `RENAME COLUMN` isn't synced). Rebuilds therefore copy the data twice, and
+  **the first push after a rebuild on a synced replica raises a `SyncError`
+  once; push again and the data converges** (`Syncer` logs it once and
+  retries).
+- **Insert return values.** `Dataset#insert` returns the last inserted row's
+  rowid. An `ON CONFLICT DO UPDATE` upsert returns the updated row's rowid, and
+  an insert that is ignored (`insert_ignore`, `ON CONFLICT DO NOTHING`) returns
+  `nil`; SQLite's `last_insert_rowid` would return a stale value there.
 
 The full list of Sequel integration tests excluded for engine gaps, with a
 reason for each, is in
