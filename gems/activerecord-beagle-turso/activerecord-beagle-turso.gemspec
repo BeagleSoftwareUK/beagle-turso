@@ -26,7 +26,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "activerecord", "~> 8.1"
-  spec.add_dependency "beagle-turso", "~> 0.2"
+  spec.add_dependency "beagle-turso", "~> 0.3"
   # AR's SQLite3Adapter `require`s the sqlite3 gem at load time (and reads a few
   # ::SQLite3 constants during connect), even though execution goes to Turso.
   spec.add_dependency "sqlite3", ">= 2.1"
