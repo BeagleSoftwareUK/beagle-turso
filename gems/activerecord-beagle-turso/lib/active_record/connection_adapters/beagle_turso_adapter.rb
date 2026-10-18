@@ -3,6 +3,7 @@
 require "active_record"
 require "active_record/connection_adapters/sqlite3_adapter"
 require "beagle/turso"
+require "active_record/connection_adapters/beagle_turso/errors"
 
 module ActiveRecord
   module ConnectionAdapters
@@ -59,6 +60,20 @@ module ActiveRecord
       INSERT_REGEX = /\bINSERT\b/i
       private_constant :INSERT_REGEX
 
+      # String literals, quoted identifiers and comments: where words like
+      # RETURNING or RENAME are data, not syntax. Masked before any keyword
+      # matching (same approach as sequel-beagle-turso).
+      NON_CODE = %r{'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|--[^\n]*|/\*.*?\*/}m
+      private_constant :NON_CODE
+
+      # `ALTER TABLE <t> RENAME ...`, tested on masked SQL.
+      RENAME_REGEX = /\A\s*ALTER\s+TABLE\s+\S+\s+RENAME\b/i
+      private_constant :RENAME_REGEX
+
+      # INSERT / REPLACE, optionally behind a WITH clause, tested on masked SQL.
+      INSERT_STATEMENT_REGEX = /\A\s*(?:(?:INSERT|REPLACE)\b|WITH\b[\s\S]*\)\s*(?:INSERT|REPLACE)\b)/i
+      private_constant :INSERT_STATEMENT_REGEX
+
       class << self
         # Open a beagle-turso Database (synced remote when +remote_url+ is
         # present, otherwise local/in-memory) and wrap it so the SQLite3Adapter
@@ -76,6 +91,10 @@ module ActiveRecord
               Beagle::Turso::Database.open_local(config[:database].to_s)
             end
           Client.new(database)
+        end
+
+        def synced_config?(config)
+          !config[:remote_url].to_s.empty? && !config[:auth_token].to_s.empty?
         end
       end
 
@@ -205,7 +224,36 @@ module ActiveRecord
         end
       end
 
+      # Refused on a synced replica: the sync engine (turso 0.8.3) does not
+      # capture `ALTER TABLE ... RENAME TO`, so the remote never gets the new
+      # name and every later write to the table is lost on push.
+      # (rename_column is allowed: Rails' SQLite adapter implements it as a
+      # copy-table, not a native RENAME COLUMN.)
+      def rename_table(table_name, new_name, **options)
+        refuse_rename!("rename_table(#{table_name.inspect}, #{new_name.inspect})")
+        super
+      end
+
+      # True when this connection is a synced replica, decided from the config
+      # exactly as new_client decides it. Deliberately does NOT touch
+      # raw_connection: the public accessor disables lazy transactions and marks
+      # the connection dirty, which would make every local-only app pay for it.
+      def synced_replica?
+        self.class.synced_config?(@config)
+      end
+
       private
+        def refuse_rename!(what)
+          return unless synced_replica?
+
+          raise BeagleTurso::UnsupportedOnSyncedReplica,
+            "beagle_turso: #{what} is not supported on a synced replica. The Turso sync engine does not " \
+            "replicate ALTER TABLE ... RENAME, so the remote would keep the old name and every later " \
+            "write to it would be lost on push. Instead: create a new table, copy the data across, then " \
+            "drop the old one; or apply the rename directly on the remote database, then pull (with " \
+            "writes to that table paused)."
+        end
+
         # Every table-listing question Rails asks (`tables`, `views`,
         # `data_sources`, `table_exists?`, and through them the schema cache and
         # the schema dumper) is built from this one string in
@@ -302,22 +350,31 @@ module ActiveRecord
         # Result#affected_rows, so building the Result correctly is all we need.
         def perform_query(raw_connection, sql, binds, type_casted_binds, prepare:, notification_payload:, batch: false)
           params = type_casted_binds || []
+          refuse_rename!(sql.strip[0, 60]) if synced_replica? && RENAME_REGEX.match?(mask_non_code(sql))
 
           result =
             if batch
               raw_connection.execute_batch(sql)
               ::ActiveRecord::Result.empty
             elsif write_statement?(sql)
-              affected = raw_connection.execute(sql, params)
-              @last_inserted_rowid = raw_connection.last_insert_rowid
-              ::ActiveRecord::Result.empty(affected_rows: affected)
+              if (rewritten = sql_with_returning_rowid(sql))
+                insert_returning_rowid(raw_connection, rewritten, params)
+              else
+                affected = raw_connection.execute(sql, params)
+                @last_inserted_rowid = raw_connection.last_insert_rowid
+                ::ActiveRecord::Result.empty(affected_rows: affected)
+              end
             else
               columns, rows = raw_connection.query_result(sql, params)
               # Belt-and-suspenders: a RETURNING insert lands here (id read from
               # rows by last_inserted_id), and a data-modifying CTE that slips past
               # write_statement? would too -- keep the rowid so an inserted id is
               # never silently lost even on a heuristic miss.
-              @last_inserted_rowid = raw_connection.last_insert_rowid if INSERT_REGEX.match?(sql)
+              if INSERT_REGEX.match?(sql)
+                # On a replica where last_insert_rowid is untrustworthy, never
+                # offer it as a fallback id (a RETURNING insert's id is in rows).
+                @last_inserted_rowid = insert_returning_rowid? ? nil : raw_connection.last_insert_rowid
+              end
               ::ActiveRecord::Result.new(columns, rows)
             end
 
@@ -335,8 +392,53 @@ module ActiveRecord
         # though it mutates. write_query? is a pure predicate here, so calling it a
         # second time is side-effect free.
         def write_statement?(sql)
-          return false if RETURNING_REGEX.match?(sql)
+          return false if returning_clause?(sql)
           write_query?(sql) || data_modifying_cte?(sql)
+        end
+
+        # On an MVCC replica with change capture (every synced replica of a
+        # `--tursodb` remote) the engine's last_insert_rowid returns the CDC
+        # change id, not the inserted row's id (tursodatabase/turso#9551).
+        # INSERT ... RETURNING is unaffected, so plain INSERTs are run as
+        # `INSERT ... RETURNING rowid` and the id is read from the result.
+        # Default: on for synced replicas; `insert_returning_rowid: true|false`
+        # in database.yml overrides (e.g. a local MVCC+CDC file).
+        def insert_returning_rowid?
+          setting = @config[:insert_returning_rowid]
+          cast = setting.nil? || setting == "" ? nil : ::ActiveModel::Type::Boolean.new.cast(setting)
+          cast.nil? ? synced_replica? : cast
+        end
+
+        # Comments become spaces (they are not part of the statement); literals
+        # and quoted identifiers become "x" (they are).
+        def mask_non_code(sql)
+          sql.gsub(NON_CODE) { |m| (m.start_with?("--", "/*") ? " " : "x") * m.length }
+        end
+
+        # A real RETURNING clause, not the word inside a literal, identifier or
+        # comment.
+        def returning_clause?(sql)
+          RETURNING_REGEX.match?(sql) && RETURNING_REGEX.match?(mask_non_code(sql))
+        end
+
+        # [rewritten_sql] when this plain INSERT should run as RETURNING rowid.
+        def sql_with_returning_rowid(sql)
+          return unless insert_returning_rowid?
+
+          masked = mask_non_code(sql)
+          return unless INSERT_STATEMENT_REGEX.match?(masked)
+          return if RETURNING_REGEX.match?(masked)
+
+          # Before any trailing ";" and trailing comment (a "--" comment would
+          # otherwise swallow the clause).
+          at = masked.sub(/;\s*\z/, "").rstrip.length
+          "#{sql[0, at]}\nRETURNING rowid#{sql[at..]}"
+        end
+
+        def insert_returning_rowid(raw_connection, rewritten, params)
+          _columns, rows = raw_connection.query_result(rewritten, params)
+          @last_inserted_rowid = rows.last&.first
+          ::ActiveRecord::Result.empty(affected_rows: rows.length)
         end
 
         def data_modifying_cte?(sql)

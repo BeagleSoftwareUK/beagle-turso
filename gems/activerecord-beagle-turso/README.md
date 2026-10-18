@@ -125,6 +125,18 @@ A recurring `SyncJob` against a local-only connection will fail every run
 with `NotSyncedError` — only add the recurring entry for environments whose
 `database.yml` connection actually carries `remote_url:`/`auth_token:`.
 
+## Synced replicas: what's guarded
+
+Three bugs in the Turso 0.8.3 sync engine affect a synced replica (`remote_url:` + `auth_token:`). Bug B is [tursodatabase/turso#9551](https://github.com/tursodatabase/turso/issues/9551); bugs A and C are being reported upstream. This adapter guards against each. Local-only connections are unchanged.
+
+- **`rename_table` is refused (bug C).** The engine does not capture `ALTER TABLE ... RENAME TO` or `RENAME COLUMN` for sync, so the remote keeps the old name and every later write to the table is lost on push. `rename_table`, and raw `execute("ALTER TABLE ... RENAME ...")`, raise `ActiveRecord::ConnectionAdapters::BeagleTurso::UnsupportedOnSyncedReplica`. Instead, create a new table, copy the data, and drop the old one; or apply the rename directly on the remote and pull, with writes to that table paused. `rename_column` is allowed: Rails 8.1's SQLite adapter implements it as a table copy, not a native `RENAME COLUMN`.
+- **Insert ids come from `RETURNING` (bug B).** On an MVCC replica with change capture (every synced replica of a `--tursodb` remote) the engine's `last_insert_rowid` returns an internal change id. Model creates already use `INSERT ... RETURNING "id"`. Plain `INSERT`s (including `WITH ... INSERT`, and `connection.insert` / `exec_insert` on a table without a named primary key) now run as `INSERT ... RETURNING rowid` and the id is read from the result. Override with `insert_returning_rowid: true|false` in `database.yml`.
+- **Migrations push first and last (bug A).** Unpushed row writes to a table that is altered or dropped before the next push are skipped by the remote and then lost on pull. When a migration is pending (or the database is new), `db:migrate`, `db:prepare` and their `:<primary>`-namespaced forms push before and after. `db:migrate:up/down/redo`, `db:rollback` and `db:forward` (also with the `:<primary>` suffix) always push, since they always run a migration. With nothing pending, `db:prepare` (which Rails 8 runs on every container boot) does no push and no network I/O.
+  - If the push before fails, the task aborts without migrating.
+  - A migration that copies a table (`change_column*`, `remove_column`, `add_foreign_key`, `add_timestamps`, ...) makes the first push after it fail once, although the remote ends up with everything. The push after is therefore retried once: if the retry works you only get a warning. If it fails twice the task fails, telling you the schema change exists locally and the push failed.
+  - Set `BEAGLE_TURSO_SKIP_MIGRATION_PUSH=1` to skip both pushes, with a warning (unpushed writes to altered tables may be lost).
+  - Only the primary database is guarded. `db:schema:load`, `db:setup` and `db:reset` do not work with this adapter (Rails raises `DatabaseNotSupported`); use migrations.
+
 ## Test coverage
 
 This gem's own spec suite (`spec/`, run via `bundle exec rspec`) is 35
