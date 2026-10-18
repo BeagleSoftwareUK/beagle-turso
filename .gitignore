@@ -27,6 +27,9 @@ mkmf.log
 # caught above; this covers the rest of the tmp/pkg scratch rake-compiler leaves behind)
 gems/*/tmp/
 gems/*/pkg/
+# `gem build` output. The release workflow uploads gems/<name>/*.gem, so a
+# committed one would be pushed along with the new version.
+gems/*/*.gem
 
 # Gem lockfile — beagle-turso is a library gem, consumers resolve their own versions
 gems/*/Gemfile.lock
