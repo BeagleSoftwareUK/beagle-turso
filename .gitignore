@@ -11,8 +11,10 @@ target/
 *.db
 *.db-*
 
-# Native extension build artifacts
+# Native extension build artifacts (.so on Linux, .bundle on macOS; the
+# .bundle rule is anchored so it doesn't also hide Bundler's .bundle/ dirs)
 *.so
+gems/*/lib/**/*.bundle
 *.o
 **/Makefile
 
