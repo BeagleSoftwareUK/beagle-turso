@@ -250,6 +250,17 @@ this gem.
    each sync — pick a sync cadence accordingly, or run Solid Queue in a separate
    process.
 
+4. **One process per database file.** A local Turso database file is locked to
+   the process that opened it (SQLite lets processes share a file; Turso does
+   not), so a second process opening it fails with `OpenError` ("... File is
+   locked by another process") while the first holds a connection. The common
+   case is handled: `bin/rails db:test:prepare test` (or `... spec`) runs the
+   tests in a child process, so when a `db:*` rake task finishes the adapter
+   releases its own file-backed connections in the rake process
+   (`BeagleTurso::TestProcessRelease`). In-memory databases, other adapters'
+   connections and `Beagle::Turso::Database`s opened outside ActiveRecord are
+   left alone.
+
 ## Known engine issue: self-referencing foreign keys
 
 Turso's engine has open bugs with foreign keys that reference their own table
