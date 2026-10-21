@@ -2,6 +2,7 @@
 
 require "active_record/connection_adapters/beagle_turso/errors"
 require "active_record/connection_adapters/beagle_turso/sync_manager"
+require "active_record/connection_adapters/beagle_turso/test_process_release"
 
 module ActiveRecord
   module ConnectionAdapters
@@ -199,6 +200,7 @@ module ActiveRecord
           rake_tasks do
             require "rake"
             MigrationPush.install!
+            TestProcessRelease.install!
           end
         end
       end
